@@ -66,6 +66,10 @@ pub fn llama_webui_dir() -> std::path::PathBuf {
     rgpu_tools_dir().join("llama-webui")
 }
 
+fn engine_log_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("llama-server.log")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineStatus {
     Stopped,
@@ -366,6 +370,12 @@ impl ClusterEngineManager {
             "4096".to_string(),
         ];
 
+        if let Some(adapter) = crate::remote_llm::trained_adapter_for_model(std::path::Path::new(model_path))
+            .map_err(|error| format!("Trained adapter validation failed: {error:#}"))?
+        {
+            args.extend(["--lora".to_string(), adapter.to_string_lossy().to_string()]);
+        }
+
         let webui_path = if cfg!(target_os = "windows") {
             "C:\\rgpu\\tools\\llama-webui".to_string()
         } else {
@@ -441,13 +451,13 @@ impl ClusterEngineManager {
         eprintln!("  LD_LIBRARY_PATH: {}", lib_path);
 
         // Create log file for debugging (truncate old content)
-        let log_path = "/tmp/llama-server.log";
+        let log_path = engine_log_path();
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true) // Clear old logs on each start
-            .open(log_path)
-            .map_err(|e| format!("Failed to create log file {}: {}", log_path, e))?;
+            .open(&log_path)
+            .map_err(|e| format!("Failed to create log file {}: {}", log_path.display(), e))?;
 
         cmd.args(&args)
             .stdout(Stdio::from(log_file.try_clone().map_err(|e| {
@@ -464,7 +474,7 @@ impl ClusterEngineManager {
                  Model: {}\n\
                  Check logs at: {}\n\
                  Error: {}",
-                e, bin_path, model_path, log_path, e
+                e, bin_path, model_path, log_path.display(), e
             )
         })?;
 
@@ -480,7 +490,7 @@ impl ClusterEngineManager {
             "[cluster_engine] llama-server spawned successfully with PID: {}",
             pid
         );
-        eprintln!("[cluster_engine] Logs available at: {}", log_path);
+        eprintln!("[cluster_engine] Logs available at: {}", log_path.display());
         eprintln!("[cluster_engine] Waiting for server to become ready (health check on :8080)...");
 
         Ok(pid)
@@ -547,14 +557,15 @@ impl ClusterEngineManager {
         if alive {
             return None;
         }
-        let log = std::fs::read_to_string("/tmp/llama-server.log").unwrap_or_default();
+        let log_path = engine_log_path();
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
         let errors: Vec<&str> = log
             .lines()
             .filter(|l| l.contains(" E ") || l.contains("error") || l.contains("failed"))
             .collect();
         let tail = errors[errors.len().saturating_sub(3)..].join("\n");
         Some(if tail.is_empty() {
-            "llama-server exited during startup. Check /tmp/llama-server.log".to_string()
+            format!("llama-server exited during startup. Check {}", log_path.display())
         } else {
             format!("llama-server exited during startup:\n{tail}")
         })
@@ -592,7 +603,7 @@ impl ClusterEngineManager {
     pub fn check_health() -> Result<String, String> {
         let body = http_get_local(8080, "/health", std::time::Duration::from_secs(3))
             .map_err(|e| {
-                format!("Server not responding on :8080 ({e})\nCheck /tmp/llama-server.log")
+                format!("Server not responding on :8080 ({e})\nCheck {}", engine_log_path().display())
             })?;
 
         // Check for various "ok" response formats

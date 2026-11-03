@@ -1,6 +1,7 @@
 use crate::mesh::{ConnectionStatus, GpuDevice, RemoteGiver};
 use anyhow::{Context, Result};
-use std::net::UdpSocket;
+use std::collections::BTreeSet;
+use std::net::{Ipv4Addr, UdpSocket};
 use std::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -9,11 +10,74 @@ use vkremote_server::{run_server_with_config, ServerConfig};
 use vkremote_wire::framing::{client_handshake, read_msg, write_msg, DEFAULT_MAX_FRAME_SIZE};
 use vkremote_wire::types::{Request, Response};
 
+fn usable_lan_ip(ip: &Ipv4Addr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_link_local()
+        && !ip.is_multicast()
+        && !ip.is_broadcast()
+}
+
+fn local_interface_ips() -> Vec<Ipv4Addr> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("ip")
+            .args(["-j", "-4", "addr", "show", "up"])
+            .output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                if let Ok(serde_json::Value::Array(mut interfaces)) =
+                    serde_json::from_slice(&output.stdout)
+                {
+                    // Prefer the Wi-Fi address in the existing single-address display.
+                    interfaces.sort_by_key(|interface| {
+                        let name = interface["ifname"].as_str().unwrap_or("");
+                        if name.starts_with("wl") {
+                            0
+                        } else if name.starts_with("en") || name.starts_with("eth") {
+                            1
+                        } else {
+                            2
+                        }
+                    });
+                    return interfaces
+                        .iter()
+                        .filter_map(|interface| interface["addr_info"].as_array())
+                        .flatten()
+                        .filter_map(|address| address["local"].as_str()?.parse().ok())
+                        .filter(usable_lan_ip)
+                        .collect();
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "$up = @(Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -ExpandProperty ifIndex); Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.AddressState -eq 'Preferred' -and $up -contains $_.InterfaceIndex } | Select-Object -ExpandProperty IPAddress"])
+            .output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                return String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| line.trim().parse().ok())
+                    .filter(usable_lan_ip)
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
 pub fn get_local_ip() -> String {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok();
-    if let Some(s) = socket {
-        if s.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = s.local_addr() {
+    if let Some(ip) = local_interface_ips().first() {
+        return ip.to_string();
+    }
+    // Preserve the route-based fallback when interface enumeration is unavailable.
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
                 return addr.ip().to_string();
             }
         }
@@ -182,21 +246,35 @@ pub async fn ping_remote_giver(endpoint: &str, token: &str) -> Result<f32> {
     Ok(latency)
 }
 
-pub async fn scan_lan_for_givers(local_ip: &str, port: u16) -> Vec<String> {
-    let parts: Vec<&str> = local_ip.split('.').collect();
-    if parts.len() != 4 {
-        return Vec::new();
-    }
-    let prefix = format!("{}.{}.{}.", parts[0], parts[1], parts[2]);
-    let local_octet: u8 = parts[3].parse().unwrap_or(0);
+fn lan_scan_targets(local_ips: &[Ipv4Addr], port: u16) -> Vec<String> {
+    let local_ips: BTreeSet<_> = local_ips.iter().copied().filter(usable_lan_ip).collect();
+    let subnets: BTreeSet<_> = local_ips
+        .iter()
+        .map(|ip| {
+            let [a, b, c, _] = ip.octets();
+            [a, b, c]
+        })
+        .collect();
+    subnets
+        .into_iter()
+        .flat_map(|[a, b, c]| (1..=254).map(move |d| Ipv4Addr::new(a, b, c, d)))
+        // Compare addresses, not string prefixes: .2 must not exclude .20 or .229.
+        .filter(|ip| !local_ips.contains(ip))
+        .map(|ip| format!("{ip}:{port}"))
+        .collect()
+}
 
+pub async fn scan_lan_for_givers(local_ip: &str, port: u16) -> Vec<String> {
+    // A hotspot and an upstream Wi-Fi/Ethernet link can be active together.
+    // Query interfaces off the async executor; retain the caller's address as fallback.
+    let mut local_ips = tokio::task::spawn_blocking(local_interface_ips)
+        .await
+        .unwrap_or_default();
+    if let Ok(ip) = local_ip.parse() {
+        local_ips.push(ip);
+    }
     let mut tasks = Vec::new();
-    for i in 1..=254 {
-        // Skip the local machine's IP - don't connect to ourselves
-        if i == local_octet {
-            continue;
-        }
-        let target = format!("{}{}:{}", prefix, i, port);
+    for target in lan_scan_targets(&local_ips, port) {
         tasks.push(tokio::spawn(async move {
             let timeout = std::time::Duration::from_millis(600);
             match tokio::time::timeout(timeout, TcpStream::connect(&target)).await {
@@ -207,14 +285,9 @@ pub async fn scan_lan_for_givers(local_ip: &str, port: u16) -> Vec<String> {
     }
 
     let mut found = Vec::new();
-    let local_endpoint = format!("{}", local_ip);
     for task in tasks {
         if let Ok(Some(addr)) = task.await {
-            // Double-check: exclude any address that matches our local IP
-            // (in case local_octet parsing failed earlier)
-            if !addr.starts_with(&local_endpoint) {
-                found.push(addr);
-            }
+            found.push(addr);
         }
     }
 
@@ -227,7 +300,7 @@ pub async fn scan_lan_for_givers(local_ip: &str, port: u16) -> Vec<String> {
             tokio::spawn(async move {
                 let ok = matches!(
                     tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
+                        std::time::Duration::from_secs(5),
                         probe_remote_giver(&addr, "vkremote-secret"),
                     )
                     .await,
@@ -288,7 +361,10 @@ pub fn start_rpc_server(port: u16) -> Result<std::process::Child> {
     } else {
         let bin_dir = crate::cluster_engine::llama_bin_dir();
         let candidates: Vec<String> = vec![
-            bin_dir.join("ggml-rpc-server").to_string_lossy().to_string(),
+            bin_dir
+                .join("ggml-rpc-server")
+                .to_string_lossy()
+                .to_string(),
             bin_dir.join("llama-server").to_string_lossy().to_string(),
             "/usr/local/bin/llama-server".to_string(),
             "/usr/bin/llama-server".to_string(),
@@ -369,6 +445,36 @@ pub fn stop_rpc_server(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_targets_preserve_peers_sharing_local_ip_prefix() {
+        let targets = lan_scan_targets(&[Ipv4Addr::new(10, 42, 0, 2)], 50051);
+        assert!(!targets.contains(&"10.42.0.2:50051".to_string()));
+        assert!(targets.contains(&"10.42.0.20:50051".to_string()));
+        assert!(targets.contains(&"10.42.0.229:50051".to_string()));
+        assert_eq!(targets.len(), 253);
+    }
+
+    #[test]
+    fn scan_targets_cover_interfaces_once_and_exclude_all_local_addresses() {
+        let ips = [
+            Ipv4Addr::new(10, 42, 0, 1),
+            Ipv4Addr::new(10, 42, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 5),
+            Ipv4Addr::new(10, 42, 0, 1),
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::new(169, 254, 1, 2),
+        ];
+        let targets = lan_scan_targets(&ips, 50051);
+        assert_eq!(targets.len(), 505);
+        assert_eq!(targets.iter().collect::<BTreeSet<_>>().len(), targets.len());
+        assert!(targets.contains(&"10.42.0.229:50051".to_string()));
+        assert!(targets.contains(&"192.168.1.10:50051".to_string()));
+        for ip in ips {
+            assert!(!targets.contains(&format!("{ip}:50051")));
+        }
+    }
 
     #[tokio::test]
     async fn test_probe_live_pc() {

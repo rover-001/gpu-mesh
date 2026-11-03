@@ -7,4 +7,7 @@ saves/
 servers.dat
 plan.md
 /tools/llama-bin/
+/.venv-training/
+/tools/llama.cpp/
+**/__pycache__/
 

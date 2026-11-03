@@ -17,6 +17,134 @@ const MAX_CONTROL_FRAME: u32 = 1024 * 1024;
 const MODEL_CHUNK_SIZE: usize = 1024 * 1024;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+const DISASTER_BASE_MODEL: &str = "Qwen/Qwen2.5-Coder-0.5B-Instruct";
+const DISASTER_GGUF_FILENAME: &str = "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf";
+
+#[derive(serde::Deserialize)]
+struct ActiveAdapter {
+    format_version: u32,
+    base_model: String,
+    base_gguf_filename: String,
+    adapter_file: String,
+    adapter_sha256: String,
+}
+
+fn validate_adapter_export(model: &Path, checkpoint_dir: &Path) -> Result<Option<PathBuf>> {
+    if model.file_name().and_then(|name| name.to_str()) != Some(DISASTER_GGUF_FILENAME) {
+        return Ok(None);
+    }
+    let manifest_path = checkpoint_dir.join("active_adapter.json");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let manifest: ActiveAdapter = serde_json::from_slice(&std::fs::read(&manifest_path)?)
+        .with_context(|| format!("Invalid adapter export {}", manifest_path.display()))?;
+    if manifest.format_version != 1
+        || manifest.base_model != DISASTER_BASE_MODEL
+        || manifest.base_gguf_filename != DISASTER_GGUF_FILENAME
+    {
+        return Err(anyhow!("Adapter export is incompatible with {}", model.display()));
+    }
+    let relative = Path::new(&manifest.adapter_file);
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(anyhow!("Adapter export must reference a relative checkpoint file"));
+    }
+    let checkpoint_root = checkpoint_dir.canonicalize()?;
+    let adapter_path = checkpoint_dir.join(relative).canonicalize()?;
+    if !adapter_path.starts_with(&checkpoint_root) {
+        return Err(anyhow!("Adapter export escapes its checkpoint directory"));
+    }
+    let mut adapter = std::fs::File::open(&adapter_path)?;
+    let mut magic = [0; 4];
+    adapter.read_exact(&mut magic)?;
+    if &magic != b"GGUF" {
+        return Err(anyhow!("Adapter export is not a GGUF tensor file"));
+    }
+    let mut digest = Sha256::new();
+    digest.update(magic);
+    let mut buffer = [0; 65536];
+    loop {
+        let count = adapter.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    if format!("{:x}", digest.finalize()) != manifest.adapter_sha256.to_ascii_lowercase() {
+        return Err(anyhow!("Adapter export checksum mismatch: {}", adapter_path.display()));
+    }
+    Ok(Some(adapter_path))
+}
+
+/// Resolve a validated real LoRA export for the matching base model only.
+/// Missing exports use the base model; malformed exports fail rather than loading
+/// unverified tensors or presenting a failed training run as an active adapter.
+pub fn trained_adapter_for_model(model: &Path) -> Result<Option<PathBuf>> {
+    if model.file_name().and_then(|name| name.to_str()) != Some(DISASTER_GGUF_FILENAME) {
+        return Ok(None);
+    }
+    let mut directories = Vec::new();
+    if let Some(parent) = model.parent() {
+        directories.push(parent.join("checkpoints"));
+    }
+    let cache = get_cache_dir().join("checkpoints");
+    if !directories.contains(&cache) {
+        directories.push(cache);
+    }
+    if cfg!(target_os = "windows") {
+        let shared = PathBuf::from("C:\\rgpu\\models\\checkpoints");
+        if !directories.contains(&shared) {
+            directories.push(shared);
+        }
+    }
+    for directory in directories {
+        if let Some(adapter) = validate_adapter_export(model, &directory)? {
+            eprintln!("[gpu-mesh] Loading trained LoRA adapter {}", adapter.display());
+            return Ok(Some(adapter));
+        }
+    }
+    eprintln!("[gpu-mesh] No validated trained adapter found; using the original Qwen 0.5B base model");
+    Ok(None)
+}
+
+fn same_local_file(left: &Path, right: &Path) -> bool {
+    left == right || match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn worker_configuration_matches(model: &Path, adapter: Option<&Path>, properties: &serde_json::Value, adapters: &serde_json::Value) -> bool {
+    let Some(loaded_model) = properties["model_path"].as_str() else { return false };
+    if !same_local_file(model, Path::new(loaded_model)) {
+        return false;
+    }
+    let Some(loaded_adapters) = adapters.as_array() else { return false };
+    match adapter {
+        None => loaded_adapters.is_empty(),
+        Some(expected) => loaded_adapters.len() == 1 && loaded_adapters[0]["path"].as_str()
+            .map(|loaded| same_local_file(expected, Path::new(loaded))).unwrap_or(false)
+            && loaded_adapters[0]["scale"].as_f64() == Some(1.0),
+    }
+}
+
+async fn worker_matches_requested_model(model: &Path) -> Result<bool> {
+    let adapter = trained_adapter_for_model(model)?;
+    let model = model.to_path_buf();
+    Ok(tokio::task::spawn_blocking(move || {
+        let get_json = |path| {
+            let body = crate::cluster_engine::http_get_local(18080, path, Duration::from_secs(2)).ok()?;
+            serde_json::from_str::<serde_json::Value>(&body).ok()
+        };
+        match (get_json("/props"), get_json("/lora-adapters")) {
+            (Some(properties), Some(adapters)) => worker_configuration_matches(&model, adapter.as_deref(), &properties, &adapters),
+            _ => false,
+        }
+    }).await.unwrap_or(false))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelManifest {
     pub name: String,
@@ -39,7 +167,7 @@ impl ModelManifest {
 
     pub fn default_qwen_draft_0_5b() -> Self {
         Self {
-            name: "Qwen2.5-Coder-0.5B-Instruct-Q4_K_M".to_string(),
+            name: "Qwen 2.5 0.5B (Disaster Model)".to_string(),
             hf_repo: "Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF".to_string(),
             filename: "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf".to_string(),
             sha256: "1d9614638d18024d0fbb36575a15f1302a3adf044df10345688ec4f6e1c4ff32".to_string(),
@@ -352,6 +480,10 @@ fn spawn_worker_llama(model: &Path, port: u16) -> Result<Child> {
         "4096".to_string(),
     ];
 
+    if let Some(adapter) = trained_adapter_for_model(model)? {
+        args.extend(["--lora".to_string(), adapter.to_string_lossy().to_string()]);
+    }
+
     let webui_path = if cfg!(target_os = "windows") {
         "C:\\rgpu\\tools\\llama-webui".to_string()
     } else {
@@ -502,7 +634,10 @@ where
         _ => return Err(anyhow!("worker session must start with StartSession or StartManifestSession")),
     };
 
-    let already_running = worker_health_ok(Duration::from_secs(1)).await;
+    // Health alone does not prove this is the requested model or the newly
+    // trained adapter. Reusing a stock-model process would silently discard training.
+    let already_running = worker_health_ok(Duration::from_secs(1)).await
+        && worker_matches_requested_model(&path).await?;
 
     let mut spawned_child = None;
     if !already_running {
@@ -815,5 +950,77 @@ mod model_resolution_check {
                 found
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod trained_adapter_tests {
+    use super::*;
+
+    struct TestExport(PathBuf);
+
+    impl TestExport {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let directory = std::env::temp_dir().join(format!("rgpu-adapter-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            std::fs::create_dir_all(directory.join("epoch-1")).unwrap();
+            std::fs::write(directory.join("epoch-1/adapter.gguf"), b"GGUFtest tensor payload").unwrap();
+            let export = Self(directory);
+            export.write_manifest(DISASTER_BASE_MODEL, "epoch-1/adapter.gguf", &format!("{:x}", Sha256::digest(b"GGUFtest tensor payload")));
+            export
+        }
+
+        fn write_manifest(&self, base_model: &str, file: &str, checksum: &str) {
+            std::fs::write(self.0.join("active_adapter.json"), serde_json::to_vec(&serde_json::json!({
+                "format_version": 1,
+                "base_model": base_model,
+                "base_gguf_filename": DISASTER_GGUF_FILENAME,
+                "adapter_file": file,
+                "adapter_sha256": checksum
+            })).unwrap()).unwrap();
+        }
+    }
+
+    impl Drop for TestExport {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn loads_matching_verified_export_and_ignores_other_models() {
+        let export = TestExport::new();
+        let actual = validate_adapter_export(Path::new(DISASTER_GGUF_FILENAME), &export.0).unwrap().unwrap();
+        assert_eq!(actual, export.0.join("epoch-1/adapter.gguf").canonicalize().unwrap());
+        assert!(validate_adapter_export(Path::new("qwen2.5-coder-7b-instruct-q4_k_m.gguf"), &export.0).unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_tampered_adapter_instead_of_loading_unverified_weights() {
+        let export = TestExport::new();
+        std::fs::write(export.0.join("epoch-1/adapter.gguf"), b"GGUFcorrupted weights").unwrap();
+        let error = validate_adapter_export(Path::new(DISASTER_GGUF_FILENAME), &export.0).unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn rejects_wrong_base_and_escaping_checkpoint_paths() {
+        let export = TestExport::new();
+        export.write_manifest("Qwen/Qwen2.5-Coder-7B-Instruct", "epoch-1/adapter.gguf", "");
+        assert!(validate_adapter_export(Path::new(DISASTER_GGUF_FILENAME), &export.0).unwrap_err().to_string().contains("incompatible"));
+        export.write_manifest(DISASTER_BASE_MODEL, "../outside.gguf", "");
+        assert!(validate_adapter_export(Path::new(DISASTER_GGUF_FILENAME), &export.0).unwrap_err().to_string().contains("relative checkpoint"));
+    }
+
+    #[test]
+    fn running_worker_must_match_model_and_active_adapter() {
+        let model = Path::new("/models/qwen.gguf");
+        let adapter = Path::new("/models/checkpoints/epoch-1/adapter.gguf");
+        let properties = serde_json::json!({"model_path": "/models/qwen.gguf"});
+        let loaded = serde_json::json!([{"path": "/models/checkpoints/epoch-1/adapter.gguf", "scale": 1.0}]);
+        assert!(worker_configuration_matches(model, Some(adapter), &properties, &loaded));
+        assert!(!worker_configuration_matches(model, Some(adapter), &properties, &serde_json::json!([])));
+        assert!(!worker_configuration_matches(model, None, &properties, &loaded));
+        assert!(!worker_configuration_matches(Path::new("/models/different.gguf"), Some(adapter), &properties, &loaded));
     }
 }

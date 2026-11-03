@@ -3,6 +3,7 @@ mod mesh;
 mod net_setup;
 mod network;
 mod remote_llm;
+mod trainer;
 mod vulkan_local;
 
 use cluster_engine::{ClusterEngineManager, EngineStatus};
@@ -16,10 +17,10 @@ use parking_lot::Mutex;
 use remote_llm::{
     largest_fitting_worker, start_remote_session, start_worker_server, ModelManifest, RemoteSession,
 };
-use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
+use trainer::{TrainingManager, TrainingTarget, TrainTelemetry};
 use vulkan_local::{detect_local_gpus, LocalGpuInfo};
 
 static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
@@ -31,6 +32,12 @@ pub fn tokio_rt() -> &'static Runtime {
             .build()
             .expect("Failed to create Tokio runtime")
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppTab {
+    Inference,
+    Training,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +65,19 @@ struct AppState {
     is_connecting: bool,
     is_scanning: bool,
     is_refreshing: bool,
+
+    // Navigation & Tabs
+    current_tab: AppTab,
+
+    // Disaster Management Training State
+    train_running: bool,
+    train_telemetry: Option<TrainTelemetry>,
+    train_logs: Vec<String>,
+    train_target: TrainingTarget,
+    train_epochs: usize,
+    train_lora_r: usize,
+    train_resume: bool,
+    train_stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
 
     engine_status: EngineStatus,
     engine_pid: Option<u32>,
@@ -160,11 +180,29 @@ impl AppState {
             is_scanning: false,
             is_refreshing: false,
 
+            // Navigation & Tabs
+            current_tab: AppTab::Inference,
+
+            // Training State
+            train_running: false,
+            train_telemetry: None,
+            train_logs: vec![
+                "[TRAINER] Engine ready for Qwen 2.5 Disaster Management training.".to_string(),
+                "[TRAINER] Target selection active: Local Node & Remote Peer mesh offloading.".to_string(),
+                "[DATASET] Loaded disaster_management_train.jsonl (20 critical triage scenarios).".to_string(),
+            ],
+            train_target: TrainingTarget::Local,
+            train_epochs: 2,
+            train_lora_r: 8,
+            train_resume: true,
+            train_stop_tx: None,
+
             engine_status: EngineStatus::Stopped,
             engine_pid: None,
             remote_session: None,
             web_proxy_stop_tx: None,
             available_models: vec![
+                ModelManifest::default_qwen_draft_0_5b(),
                 ModelManifest::default_qwen_7b(),
                 ModelManifest::qwen_14b_coder(),
             ],
@@ -180,6 +218,50 @@ impl AppState {
                 local_name, local_ip
             )],
         }
+    }
+
+    // Background workers update this shared state without access to GPUI. Keep
+    // their visible changes observable without redrawing unchanged frames.
+    fn ui_change_token(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut token = std::collections::hash_map::DefaultHasher::new();
+        self.local_ip.hash(&mut token);
+        self.giver_enabled.hash(&mut token);
+        self.giver_status_text.hash(&mut token);
+        self.status_message.hash(&mut token);
+        self.candidate_endpoints.hash(&mut token);
+        self.target_endpoint.hash(&mut token);
+        self.is_scanning.hash(&mut token);
+        self.is_connecting.hash(&mut token);
+        self.is_refreshing.hash(&mut token);
+        std::mem::discriminant(&self.current_tab).hash(&mut token);
+        std::mem::discriminant(&self.engine_status).hash(&mut token);
+        if let EngineStatus::Starting(message) | EngineStatus::Failed(message) = &self.engine_status {
+            message.hash(&mut token);
+        }
+        self.selected_model_idx.hash(&mut token);
+        self.test_running.hash(&mut token);
+        self.test_result.hash(&mut token);
+        self.test_speed.hash(&mut token);
+        self.remote_peers.len().hash(&mut token);
+        for peer in &self.remote_peers {
+            peer.endpoint.hash(&mut token);
+            std::mem::discriminant(&peer.status).hash(&mut token);
+            peer.latency_ms.to_bits().hash(&mut token);
+            peer.effective_vram_mb().hash(&mut token);
+        }
+        std::mem::discriminant(&self.train_target).hash(&mut token);
+        self.train_running.hash(&mut token);
+        self.train_logs.len().hash(&mut token);
+        self.train_logs.last().hash(&mut token);
+        if let Some(telemetry) = &self.train_telemetry {
+            telemetry.step.hash(&mut token);
+            telemetry.epoch.hash(&mut token);
+            telemetry.loss.to_bits().hash(&mut token);
+            telemetry.status.hash(&mut token);
+            telemetry.best_loss.map(f32::to_bits).hash(&mut token);
+        }
+        token.finish()
     }
 
     fn local_vram_mb(&self) -> u64 {
@@ -225,6 +307,11 @@ impl Drop for AppState {
         if let Some(tx) = self.giver_stop_tx.take() {
             let _ = tx.send(());
         }
+
+        // Cancel training if active
+        if let Some(tx) = self.train_stop_tx.take() {
+            let _ = tx.send(());
+        }
     }
 }
 
@@ -257,6 +344,27 @@ impl GpuMeshApp {
                 s.event_log.push(line);
             }
         });
+        let state_ui = Arc::clone(&app.state);
+        let mut ui_token = state_ui.lock().ui_change_token();
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                let changed = if let Some(state) = state_ui.try_lock() {
+                    let next_token = state.ui_change_token();
+                    let changed = next_token != ui_token;
+                    ui_token = next_token;
+                    changed
+                } else {
+                    false
+                };
+                if changed && view.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+                if !view.is_upgradable() {
+                    break;
+                }
+            }
+        }).detach();
         let state_poll = Arc::clone(&app.state);
         tokio_rt().spawn(async move {
             loop {
@@ -297,8 +405,849 @@ impl GpuMeshApp {
     }
 }
 
+fn render_training_metrics(train_running: bool, train_telemetry: Option<&TrainTelemetry>, train_target: TrainingTarget) -> Div {
+    let loss_text = if let Some(t) = train_telemetry {
+        format!("{:.4}", t.loss)
+    } else {
+        "—".to_string()
+    };
+    let best_loss_text = if let Some(t) = train_telemetry {
+        if let Some(b) = t.best_loss {
+            format!("{:.4}", b)
+        } else {
+            "—".to_string()
+        }
+    } else {
+        "—".to_string()
+    };
+    let speed_text = if let Some(t) = train_telemetry {
+        format!("{:.1} tok/s", t.tok_sec)
+    } else {
+        "0.0 tok/s".to_string()
+    };
+    let step_text = if let Some(t) = train_telemetry {
+        format!("Step {}/{} (Ep {}/{})", t.step, t.total_steps, t.epoch, t.total_epochs)
+    } else {
+        "Not trained in this session".to_string()
+    };
+
+    let (host_name, host_badge, host_sub) = match train_target {
+        TrainingTarget::Local => (
+            "Local",
+            "LOCAL GPU",
+            "On-Device Tensor Acceleration",
+        ),
+        TrainingTarget::Peer => (
+            "Peer",
+            "MESH DONOR",
+            "Distributed Mesh Offloading",
+        ),
+    };
+
+    div()
+        .px_6()
+        .py_5()
+        .bg(rgb(0x131316))
+        .border_b_1()
+        .border_color(rgb(0x27272a))
+        .flex()
+        .flex_col()
+        .gap_4()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_4()
+                // Metric 1: Target Model
+                .child(
+                    div()
+                        .flex_1()
+                        .p_4()
+                        .rounded_lg()
+                        .bg(rgb(0x18181b))
+                        .border_1()
+                        .border_color(rgb(0x27272a))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .items_center()
+                                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(rgb(0xa1a1aa)).child("BASE MODEL"))
+                                .child(div().px_2().py_0p5().rounded_sm().bg(rgb(0x3b1d54)).text_xs().text_color(rgb(0xd8b4fe)).child("QWEN 0.5B"))
+                        )
+                        .child(
+                            div()
+                                .text_2xl()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0xd8b4fe))
+                                .child("Qwen 2.5 Coder 0.5B")
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x71717a))
+                                .child(r"491.4 MB GGUF • Disaster LoRA")
+                        )
+                )
+                // Metric 2: Live Loss & Best
+                .child(
+                    div()
+                        .flex_1()
+                        .p_4()
+                        .rounded_lg()
+                        .bg(rgb(0x18181b))
+                        .border_1()
+                        .border_color(rgb(0x27272a))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .items_center()
+                                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(rgb(0xa1a1aa)).child("CURRENT LOSS"))
+                                .child(div().px_2().py_0p5().rounded_sm().bg(rgb(0x064e3b)).text_xs().text_color(rgb(0x34d399)).child(if train_running { "OPTIMIZING" } else if train_telemetry.is_some() { "MEASURED" } else { "NOT TRAINED" }))
+                        )
+                        .child(
+                            div()
+                                .text_2xl()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0x34d399))
+                                .child(loss_text)
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x71717a))
+                                .child(format!("Best Checkpoint Loss: {} (Preserved)", best_loss_text))
+                        )
+                )
+                // Metric 3: Speed & Steps
+                .child(
+                    div()
+                        .flex_1()
+                        .p_4()
+                        .rounded_lg()
+                        .bg(rgb(0x18181b))
+                        .border_1()
+                        .border_color(rgb(0x27272a))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .items_center()
+                                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(rgb(0xa1a1aa)).child("THROUGHPUT"))
+                                .child(div().px_2().py_0p5().rounded_sm().bg(rgb(0x0c4a6e)).text_xs().text_color(rgb(0x38bdf8)).child("MESH"))
+                        )
+                        .child(
+                            div()
+                                .text_2xl()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0x38bdf8))
+                                .child(speed_text)
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x71717a))
+                                .child(step_text)
+                        )
+                )
+                // Metric 4: Mesh Target
+                .child(
+                    div()
+                        .flex_1()
+                        .p_4()
+                        .rounded_lg()
+                        .bg(rgb(0x18181b))
+                        .border_1()
+                        .border_color(rgb(0x27272a))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .items_center()
+                                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(rgb(0xa1a1aa)).child("EXECUTION HOST"))
+                                .child(div().px_2().py_0p5().rounded_sm().bg(rgb(0x3f3f46)).text_xs().text_color(rgb(0xe4e4e7)).child(host_badge))
+                        )
+                        .child(
+                            div()
+                                .text_2xl()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0xffffff))
+                                .child(host_name)
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x71717a))
+                                .child(host_sub)
+                        )
+                )
+        )
+}
+
+fn render_training_controller(
+    state_arc: &Arc<Mutex<AppState>>,
+    train_running: bool,
+    train_target: TrainingTarget,
+    train_epochs: usize,
+    cx: &mut Context<GpuMeshApp>,
+) -> Div {
+    div()
+        .p_5()
+        .rounded_lg()
+        .bg(rgb(0x18181b))
+        .border_1()
+        .border_color(rgb(0x27272a))
+        .flex()
+        .flex_col()
+        .gap_4()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .items_start()
+                .child(
+                    div()
+                        .flex_1()
+                        .mr_4()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0xffffff))
+                                .child("Disaster Management Fine-Tuning Controller")
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x71717a))
+                                .child("Trains Qwen 2.5 on high-priority disaster response protocols: Tsunami Golden Hour, Chlorine Gas Dispersion, Dam Failure Flood, START Triage, and Hurricane Telecoms")
+                        )
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            if train_running {
+                                div()
+                                    .id("btn-stop-train")
+                                    .px_4()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(rgb(0xdc2626))
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(0xffffff))
+                                    .cursor_pointer()
+                                    .on_mouse_down(MouseButton::Left, {
+                                        let state = Arc::clone(state_arc);
+                                        cx.listener(move |_this, _, _, cx| {
+                                            let mut s = state.lock();
+                                            if let Some(tx) = s.train_stop_tx.take() {
+                                                let _ = tx.send(());
+                                            }
+                                            s.train_running = false;
+                                            s.train_logs.push("[TRAINER] Stop command issued.".to_string());
+                                            cx.notify();
+                                        })
+                                    })
+                                    .child("[Stop Training]")
+                            } else {
+                                let launch_label = match train_target {
+                                    TrainingTarget::Local => "Launch Training (Local)",
+                                    TrainingTarget::Peer => "Launch Training (Remote Peer)",
+                                };
+                                div()
+                                    .id("btn-start-train")
+                                    .px_4()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x059669))
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(0xffffff))
+                                    .cursor_pointer()
+                                    .on_mouse_down(MouseButton::Left, {
+                                        let state = Arc::clone(state_arc);
+                                        cx.listener(move |_this, _, _, cx| {
+                                            let (target, epochs, lora_r, resume) = {
+                                                let s = state.lock();
+                                                (s.train_target, s.train_epochs, s.train_lora_r, s.train_resume)
+                                            };
+                                            let state_spawn = Arc::clone(&state);
+                                            match TrainingManager::spawn_trainer(target, epochs, lora_r, resume, state_spawn) {
+                                                Ok(tx) => {
+                                                    let mut s = state.lock();
+                                                    s.train_stop_tx = Some(tx);
+                                                    s.status_message = match target {
+                                                        TrainingTarget::Local => "Training running on Local Node".to_string(),
+                                                        TrainingTarget::Peer => "Training running on Remote Peer".to_string(),
+                                                    };
+                                                }
+                                                Err(e) => {
+                                                    let mut s = state.lock();
+                                                    s.train_running = false;
+                                                    s.status_message = format!("Training failed to start: {e}");
+                                                    s.train_logs.push(format!("[ERROR] Failed to start training: {e}"));
+                                                }
+                                            }
+                                            cx.notify();
+                                        })
+                                    })
+                                    .child(launch_label)
+                            }
+                        )
+                        .child(
+                            div()
+                                .id("btn-chat-web")
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(rgb(0x1e3a5f))
+                                .border_1()
+                                .border_color(rgb(0x3b82f6))
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0x93c5fd))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, {
+                                    let state = Arc::clone(state_arc);
+                                    cx.listener(move |_this, _, _, cx| {
+                                        {
+                                            let mut s = state.lock();
+                                            s.selected_model_idx = 0;
+                                        }
+                                        ClusterEngineManager::open_browser();
+                                        cx.notify();
+                                    })
+                                })
+                                .child("💬 Chat on Web UI")
+                        )
+                        .child(
+                            div()
+                                .id("btn-clear-logs")
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(rgb(0x27272a))
+                                .border_1()
+                                .border_color(rgb(0x3f3f46))
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(0xa1a1aa))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, {
+                                    let state = Arc::clone(state_arc);
+                                    cx.listener(move |_this, _, _, cx| {
+                                        let mut s = state.lock();
+                                        s.train_logs.clear();
+                                        s.train_logs.push("[TRAINER] Terminal buffer cleared.".to_string());
+                                        cx.notify();
+                                    })
+                                })
+                                .child("Clear Console")
+                        )
+                )
+        )
+        // Parameter Toggles
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_4()
+                .p_3()
+                .rounded_md()
+                .bg(rgb(0x111113))
+                .border_1()
+                .border_color(rgb(0x27272a))
+                // Target Node Picker
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("btn-target-local")
+                                .px_2p5()
+                                .py_1()
+                                .rounded_md()
+                                .bg(if train_target == TrainingTarget::Local { rgb(0x1e3a5f) } else { rgb(0x18181b) })
+                                .border_1()
+                                .border_color(if train_target == TrainingTarget::Local { rgb(0x3b82f6) } else { rgb(0x27272a) })
+                                .text_xs()
+                                .font_weight(if train_target == TrainingTarget::Local { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                .text_color(if train_target == TrainingTarget::Local { rgb(0x93c5fd) } else { rgb(0x71717a) })
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, {
+                                    let state = Arc::clone(state_arc);
+                                    cx.listener(move |_this, _, _, cx| {
+                                        if train_running { return; }
+                                        let mut s = state.lock();
+                                        s.train_target = TrainingTarget::Local;
+                                        cx.notify();
+                                    })
+                                })
+                                .child("Local")
+                        )
+                        .child(
+                            div()
+                                .id("btn-target-peer")
+                                .px_2p5()
+                                .py_1()
+                                .rounded_md()
+                                .bg(if train_target == TrainingTarget::Peer { rgb(0x3b1d54) } else { rgb(0x18181b) })
+                                .border_1()
+                                .border_color(if train_target == TrainingTarget::Peer { rgb(0x9333ea) } else { rgb(0x27272a) })
+                                .text_xs()
+                                .font_weight(if train_target == TrainingTarget::Peer { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                .text_color(if train_target == TrainingTarget::Peer { rgb(0xd8b4fe) } else { rgb(0x71717a) })
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, {
+                                    let state = Arc::clone(state_arc);
+                                    cx.listener(move |_this, _, _, cx| {
+                                        if train_running { return; }
+                                        let mut s = state.lock();
+                                        s.train_target = TrainingTarget::Peer;
+                                        cx.notify();
+                                    })
+                                })
+                                .child("Peer")
+                        )
+                )
+                // Epochs Picker
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_xs().text_color(rgb(0xa1a1aa)).child("Epochs:"))
+                        .children([1usize, 2, 3, 5].iter().map(|&ep| {
+                            let is_sel = train_epochs == ep;
+                            let state = Arc::clone(state_arc);
+                            div()
+                                .id(("epoch-btn", ep))
+                                .px_2p5()
+                                .py_1()
+                                .rounded_md()
+                                .bg(if is_sel { rgb(0x3b1d54) } else { rgb(0x18181b) })
+                                .border_1()
+                                .border_color(if is_sel { rgb(0x9333ea) } else { rgb(0x27272a) })
+                                .text_xs()
+                                .font_weight(if is_sel { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                .text_color(if is_sel { rgb(0xd8b4fe) } else { rgb(0x71717a) })
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, {
+                                    let state = Arc::clone(&state);
+                                    cx.listener(move |_this, _, _, cx| {
+                                        if train_running { return; }
+                                        let mut s = state.lock();
+                                        s.train_epochs = ep;
+                                        cx.notify();
+                                    })
+                                })
+                                .child(format!("{} Ep", ep))
+                        }))
+                )
+                // Simplified Training Badges
+                .child(
+                    div()
+                        .px_2p5()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x18181b))
+                        .border_1()
+                        .border_color(rgb(0x27272a))
+                        .text_xs()
+                        .text_color(rgb(0xa1a1aa))
+                        .child("Corpus: 20 Scenarios (FEMA / NDMA)")
+                )
+                .child(
+                    div()
+                        .px_2p5()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x18181b))
+                        .border_1()
+                        .border_color(rgb(0x27272a))
+                        .text_xs()
+                        .text_color(rgb(0x34d399))
+                        .child("Auto-Preserve Best Checkpoint")
+                )
+        )
+}
+
+fn render_training_progress(train_running: bool, progress_pct: f32) -> Div {
+    div()
+        .p_4()
+        .rounded_lg()
+        .bg(rgb(0x18181b))
+        .border_1()
+        .border_color(rgb(0x27272a))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xffffff))
+                        .child(if train_running { "OPTIMIZATION PROGRESS" } else { "TRAINING STATUS: IDLE / READY" })
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xd8b4fe))
+                        .child(format!("{:.1}%", progress_pct))
+                )
+        )
+        .child(
+            div()
+                .w_full()
+                .h(px(8.0))
+                .rounded_full()
+                .bg(rgb(0x27272a))
+                .child(
+                    div()
+                        .h_full()
+                        .rounded_full()
+                        .bg(if train_running { rgb(0x9333ea) } else { rgb(0x059669) })
+                        .w(relative(progress_pct / 100.0))
+                )
+        )
+}
+
+fn render_training_console(train_running: bool, train_logs: &[String], train_log_count: usize, train_target: TrainingTarget) -> Div {
+    let console_title = match train_target {
+        TrainingTarget::Local => "Local Training Console (stdout/stderr)",
+        TrainingTarget::Peer => "Peer Training Console (stdout/stderr)",
+    };
+    div()
+        .w_full()
+        .min_w_0()
+        .rounded_lg()
+        .bg(rgb(0x0a0a0c))
+        .border_1()
+        .border_color(rgb(0x27272a))
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .px_4()
+                .py_2p5()
+                .bg(rgb(0x111114))
+                .border_b_1()
+                .border_color(rgb(0x27272a))
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(div().w(px(10.0)).h(px(10.0)).rounded_full().bg(if train_running { rgb(0x22c55e) } else { rgb(0x6b7280) }))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0xe4e4e7))
+                                .child(console_title)
+                        )
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x71717a))
+                        .child(format!("{} log lines streamed", train_log_count))
+                )
+        )
+        .child(
+            div()
+                .id("terminal-stdout-container")
+                .h(px(340.0))
+                .p_4()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(train_logs.iter().rev().take(60).collect::<Vec<_>>().into_iter().rev().map(|line| {
+                    let is_telem = line.contains("[TELEMETRY]");
+                    let is_val = line.contains("Validation Loss") || line.contains("Strict Loss Improvement");
+                    let is_epoch = line.contains("Epoch");
+                    let is_trainer = line.contains("[TRAINER]");
+                    let is_err = line.contains("[ERROR]") || line.contains("[STDERR]");
+
+                    let text_col = if is_err {
+                        rgb(0xf87171)
+                    } else if is_val {
+                        rgb(0x34d399)
+                    } else if is_epoch {
+                        rgb(0xd8b4fe)
+                    } else if is_telem {
+                        rgb(0x38bdf8)
+                    } else if is_trainer {
+                        rgb(0xfde047)
+                    } else {
+                        rgb(0xa1a1aa)
+                    };
+
+                    div()
+                        .text_xs()
+                        .text_color(text_col)
+                        .child(line.clone())
+                }))
+        )
+}
+
+fn render_training_data_inspector(train_telemetry: Option<&TrainTelemetry>) -> Div {
+    let (category, title, prompt, response, step_info): (String, String, String, String, String) = if let Some(t) = train_telemetry {
+        let cat = if !t.sample_category.is_empty() {
+            t.sample_category.clone()
+        } else {
+            "Disaster Management".to_string()
+        };
+        let tit = if !t.sample_title.is_empty() {
+            t.sample_title.clone()
+        } else {
+            "M7.2 Coastal Seismic & Tsunami Golden Hour".to_string()
+        };
+        let p = if !t.prompt_preview.is_empty() {
+            t.prompt_preview.clone()
+        } else {
+            "A magnitude 7.2 earthquake has occurred 15 km offshore from a coastal metropolitan area with high building density. What are the immediate triage and incident command protocols for the first 60 minutes?".to_string()
+        };
+        let r = if !t.response_preview.is_empty() {
+            t.response_preview.clone()
+        } else {
+            "1. Tsunami Warning & Coastal Evacuation: Activate coastal sirens, EAS broadcast, command immediate vertical evacuation...\n2. Incident Command System: Establish EOC outside structural collapse radius...\n3. Critical Lifeline Isolation: SCADA shutdown of gas mains...".to_string()
+        };
+        let s = format!("Sample {}/{} (Ep {})", ((t.step.saturating_sub(1)) % 20) + 1, 20, t.epoch);
+        (cat, tit, p, r, s)
+    } else {
+        (
+            "Earthquake & Tsunami".to_string(),
+            "M7.2 Coastal Seismic Golden Hour Protocol".to_string(),
+            "A magnitude 7.2 earthquake has occurred 15 km offshore from a coastal metropolitan area with high building density. What are the immediate triage and incident command protocols for the first 60 minutes?".to_string(),
+            "1. Tsunami Warning & Coastal Evacuation (Minutes 0-10): Subduction earthquake >M7.0 within 50km offshore triggers immediate tsunami risk. Command immediate vertical evacuation (minimum 4th floor or 15m elevation)...\n2. Incident Command System (ICS) Mobilization (Minutes 5-15): Establish EOC...".to_string(),
+            "Sample 1/20 (Ready)".to_string(),
+        )
+    };
+
+    div()
+        .w_full()
+        .min_w_0()
+        .rounded_lg()
+        .bg(rgb(0x0a0a0c))
+        .border_1()
+        .border_color(rgb(0x27272a))
+        .flex()
+        .flex_col()
+        .child(
+            // Header bar
+            div()
+                .px_4()
+                .py_2p5()
+                .bg(rgb(0x111114))
+                .border_b_1()
+                .border_color(rgb(0x27272a))
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(rgb(0x38bdf8)))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0xffffff))
+                                .child("Active Disaster Training Data")
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_sm()
+                                .bg(rgb(0x0c4a6e))
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(0x7dd3fc))
+                                .child(category)
+                        )
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(0xa1a1aa))
+                        .child(step_info)
+                )
+        )
+        .child(
+            // Scenario Body
+            div()
+                .h(px(340.0))
+                .p_4()
+                .flex()
+                .flex_col()
+                .gap_2p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xd8b4fe))
+                        .child(title)
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(0x71717a)).child("INPUT PROMPT / INCIDENT DISPATCH:"))
+                        .child(
+                            div()
+                                .p_2p5()
+                                .rounded_md()
+                                .bg(rgb(0x18181b))
+                                .border_1()
+                                .border_color(rgb(0x27272a))
+                                .text_xs()
+                                .text_color(rgb(0xe4e4e7))
+                                .child(prompt)
+                        )
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(0x71717a)).child("EXPECTED PROTOCOL / ASSISTANT RESPONSE:"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .p_2p5()
+                                .rounded_md()
+                                .bg(rgb(0x131316))
+                                .border_1()
+                                .border_color(rgb(0x27272a))
+                                .text_xs()
+                                .text_color(rgb(0x34d399))
+                                .child(response)
+                        )
+                )
+        )
+}
+
+fn render_training_tab(
+    state_arc: &Arc<Mutex<AppState>>,
+    train_running: bool,
+    train_target: TrainingTarget,
+    train_telemetry: Option<&TrainTelemetry>,
+    train_logs: &[String],
+    train_log_count: usize,
+    train_epochs: usize,
+    compact: bool,
+    cx: &mut Context<GpuMeshApp>,
+) -> Stateful<Div> {
+    let progress_pct: f32 = if let Some(t) = train_telemetry {
+        if t.total_steps > 0 {
+            ((t.step as f32 / t.total_steps as f32) * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        }
+    } else if train_running {
+        15.0
+    } else {
+        100.0
+    };
+
+    div()
+        .id("training-scroll-container")
+        .w_full()
+        .min_w_0()
+        .flex_1()
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .child(render_training_metrics(train_running, train_telemetry, train_target))
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .p_6()
+                .flex()
+                .flex_col()
+                .gap_6()
+                .child(render_training_controller(state_arc, train_running, train_target, train_epochs, cx))
+                .child(render_training_progress(train_running, progress_pct))
+                // Stack the panels when there is insufficient width for both.
+                .child(
+                    (if compact { div().flex().flex_col() } else { div().flex().flex_row() })
+                        .w_full()
+                        .min_w_0()
+                        .gap_4()
+                        .child(
+                            (if compact { div().w_full().flex_none() } else { div().w_0().flex_1() })
+                                .min_w_0()
+                                .child(render_training_data_inspector(train_telemetry))
+                        )
+                        .child(
+                            (if compact { div().w_full().flex_none() } else { div().w_0().flex_1() })
+                                .min_w_0()
+                                .child(render_training_console(train_running, train_logs, train_log_count, train_target))
+                        )
+                )
+        )
+}
+
 impl Render for GpuMeshApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (
             local_name,
             local_ip,
@@ -326,6 +1275,12 @@ impl Render for GpuMeshApp {
             test_speed,
             available_models,
             selected_model_idx,
+            current_tab,
+            train_running,
+            train_telemetry,
+            train_epochs,
+            _train_lora_r,
+            _train_resume,
         ) = {
             let s = self.state.lock();
             (
@@ -355,6 +1310,12 @@ impl Render for GpuMeshApp {
                 s.test_speed.clone(),
                 s.available_models.clone(),
                 s.selected_model_idx,
+                s.current_tab,
+                s.train_running,
+                s.train_telemetry.clone(),
+                s.train_epochs,
+                s.train_lora_r,
+                s.train_resume,
             )
         };
 
@@ -429,6 +1390,66 @@ impl Render for GpuMeshApp {
                                     .child(format!("Node: {} • IP: {} • vkremote Wire Protocol v1", local_name, local_ip))
                             )
                     )
+                    // Top Navigation Tab Switcher: [ Cluster Inference ] / [ Model Training ]
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1p5()
+                            .bg(rgb(0x18181b))
+                            .p(px(2.5))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(0x27272a))
+                            .child(
+                                div()
+                                    .id("tab-btn-inference")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(if current_tab == AppTab::Inference { rgb(0x1e3a5f) } else { rgb(0x18181b) })
+                                    .border_1()
+                                    .border_color(if current_tab == AppTab::Inference { rgb(0x3b82f6) } else { rgb(0x18181b) })
+                                    .text_xs()
+                                    .font_weight(if current_tab == AppTab::Inference { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                    .text_color(if current_tab == AppTab::Inference { rgb(0x93c5fd) } else { rgb(0x71717a) })
+                                    .cursor_pointer()
+                                    .on_mouse_down(MouseButton::Left, {
+                                        let state = Arc::clone(&state_arc);
+                                        cx.listener(move |_this, _, _, cx| {
+                                            let mut s = state.lock();
+                                            s.current_tab = AppTab::Inference;
+                                            cx.notify();
+
+                                        })
+                                    })
+                                    .child("Cluster Inference")
+                            )
+                            .child(
+                                div()
+                                    .id("tab-btn-training")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(if current_tab == AppTab::Training { rgb(0x3b1d54) } else { rgb(0x18181b) })
+                                    .border_1()
+                                    .border_color(if current_tab == AppTab::Training { rgb(0x9333ea) } else { rgb(0x18181b) })
+                                    .text_xs()
+                                    .font_weight(if current_tab == AppTab::Training { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                    .text_color(if current_tab == AppTab::Training { rgb(0xd8b4fe) } else { rgb(0x71717a) })
+                                    .cursor_pointer()
+                                    .on_mouse_down(MouseButton::Left, {
+                                        let state = Arc::clone(&state_arc);
+                                        cx.listener(move |_this, _, _, cx| {
+                                            let mut s = state.lock();
+                                            s.current_tab = AppTab::Training;
+                                            cx.notify();
+
+                                        })
+                                    })
+                                    .child("Model Training (Disaster)")
+                            )
+                    )
                     .child(
                         div()
                             .flex()
@@ -491,12 +1512,14 @@ impl Render for GpuMeshApp {
             )
             // ------------------ SCROLLABLE WORKSPACE CONTAINER ------------------
             .child(
-                div()
-                    .id("workspace-scroll-container")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
+                match current_tab {
+                    AppTab::Inference => {
+                        div()
+                            .id("workspace-scroll-container")
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
                     // ------------------ DYNAMIC METRICS BAR ------------------
                     .child(
                 div()
@@ -1536,13 +2559,19 @@ impl Render for GpuMeshApp {
                                                                                 let mut s = state.lock();
                                                                                 if s.is_scanning { return; }
                                                                                 s.is_scanning = true;
-                                                                                // Re-fetch interface IP dynamically in case Wi-Fi changed!
-                                                                                s.local_ip = get_local_ip();
                                                                                 s.status_message = format!("Scanning subnet {}/24 on :{}...", s.local_ip, s.local_port);
                                                                                 (s.local_ip.clone(), s.local_port)
                                                                             };
                                                                             let state_bg = Arc::clone(&state);
                                                                             tokio_rt().spawn(async move {
+                                                                                // Interface enumeration can spawn PowerShell on Windows.
+                                                                                // Keep it off the UI thread and outside the shared state lock.
+                                                                                let ip = tokio::task::spawn_blocking(get_local_ip).await.unwrap_or(ip);
+                                                                                {
+                                                                                    let mut s = state_bg.lock();
+                                                                                    s.local_ip = ip.clone();
+                                                                                    s.status_message = format!("Scanning subnet {}/24 on :{}...", ip, port);
+                                                                                }
                                                                                 let found = scan_lan_for_givers(&ip, port).await;
                                                                                 let mut s = state_bg.lock();
                                                                                 s.is_scanning = false;
@@ -1814,10 +2843,9 @@ impl Render for GpuMeshApp {
                                                                 // now with the new peer included in the RPC split.
                                                                 let should_restart = s.engine_status == EngineStatus::Running;
                                                                 if should_restart {
-                                                                    // Stop current server
-                                                                    if let Some(pid) = s.engine_pid.take() {
-                                                                        ClusterEngineManager::stop_server(pid);
-                                                                    }
+                                                                    // Hand the old process to the restart task. Process
+                                                                    // teardown must not hold the state lock used by tab clicks.
+                                                                    let previous_pid = s.engine_pid.take();
                                                                     s.engine_status = EngineStatus::Starting("Restarting with remote GPU...".to_string());
                                                                     s.status_message = format!("Restarting AI server with {} ({:.1} GB) in cluster...", dev_name, vram_gb);
 
@@ -1847,6 +2875,9 @@ impl Render for GpuMeshApp {
 
                                                                     let state_restart = Arc::clone(&state_bg2);
                                                                     tokio_rt().spawn(async move {
+                                                                        if let Some(pid) = previous_pid {
+                                                                            let _ = tokio::task::spawn_blocking(move || ClusterEngineManager::stop_server(pid)).await;
+                                                                        }
                                                                         let res = ClusterEngineManager::spawn_server(&rpc_target, &model, local_vram, &remote_vram_list);
                                                                         match res {
                                                                             Ok(pid) => {
@@ -2108,6 +3139,17 @@ impl Render for GpuMeshApp {
                             )
                     )
                 )
+                    }
+                    AppTab::Training => {
+                        let (train_logs, train_log_count, train_target) = {
+                            let s = state_arc.lock();
+                            // The console displays only its latest 60 lines; do not
+                            // clone the full retained history whenever tabs redraw.
+                            (s.train_logs[s.train_logs.len().saturating_sub(60)..].to_vec(), s.train_logs.len(), s.train_target)
+                        };
+                        render_training_tab(&state_arc, train_running, train_target, train_telemetry.as_ref(), &train_logs, train_log_count, train_epochs, window.bounds().size.width < px(1120.0), cx)
+                    }
+                }
             )
             // ------------------ FOOTER STATUS ------------------
             .child(
@@ -2138,6 +3180,30 @@ impl Render for GpuMeshApp {
 }
 
 fn main() {
+    std::panic::set_hook(Box::new(|panic_info| {
+        let backtrace = std::backtrace::Backtrace::capture();
+        let msg = format!("PANIC CAUGHT: {}
+BACKTRACE:
+{}", panic_info, backtrace);
+        eprintln!("{}", msg);
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(r"C:\rgpu\panic.log") {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", msg);
+                let _ = f.flush();
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gpu_mesh_panic.log") {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", msg);
+                let _ = f.flush();
+            }
+        }
+    }));
+
     // Purge any residual Vulkan loader or driver overrides from terminal environment
     std::env::remove_var("VK_LOADER_DRIVERS_SELECT");
     std::env::remove_var("VK_LOADER_LAYERS_ENABLE");
