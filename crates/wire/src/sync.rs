@@ -51,6 +51,35 @@ impl MemorySyncTracker {
         diffs
     }
 
+    /// Like `compute_dirty_chunks`, but only examines the chunks starting at the
+    /// given offsets (multiples of `CHUNK_SIZE`, e.g. from OS write tracking).
+    pub fn compute_dirty_chunks_at(
+        &mut self,
+        allocation_id: u64,
+        memory: &[u8],
+        chunk_offsets: &[usize],
+    ) -> Vec<MemoryChunkDiff> {
+        let mut diffs = Vec::new();
+        for &offset in chunk_offsets {
+            if offset >= memory.len() || offset % CHUNK_SIZE != 0 {
+                continue;
+            }
+            let chunk_len = (memory.len() - offset).min(CHUNK_SIZE);
+            let chunk_data = &memory[offset..offset + chunk_len];
+            let hash = xxh3_64(chunk_data);
+            let key = (allocation_id, offset as u64);
+            if self.chunk_hashes.get(&key) != Some(&hash) {
+                self.chunk_hashes.insert(key, hash);
+                diffs.push(MemoryChunkDiff {
+                    allocation_id,
+                    offset: offset as u64,
+                    data: chunk_data.to_vec(),
+                });
+            }
+        }
+        diffs
+    }
+
     pub fn mark_clean(&mut self, allocation_id: u64, offset: u64, data: &[u8]) {
         let hash = xxh3_64(data);
         self.chunk_hashes.insert((allocation_id, offset), hash);

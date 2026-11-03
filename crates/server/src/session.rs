@@ -127,6 +127,22 @@ pub struct VulkanSession {
     command_pools: HashMap<u64, vk::CommandPool>,
     command_buffers: HashMap<u64, vk::CommandBuffer>,
     fences: HashMap<u64, vk::Fence>,
+    /// Last frame sent per swapchain, for XOR delta presentation.
+    last_frames: HashMap<u64, Vec<u8>>,
+}
+
+/// XOR `cur` into `prev` (so `prev` becomes the delta) and return it, while
+/// storing `cur` as the new reference. Both slices must be the same length.
+fn xor_delta_in_place(prev: &mut [u8], cur: &[u8]) {
+    let mut p = prev.chunks_exact_mut(8);
+    let mut c = cur.chunks_exact(8);
+    for (a, b) in (&mut p).zip(&mut c) {
+        let x = u64::from_ne_bytes(a.try_into().unwrap()) ^ u64::from_ne_bytes(b.try_into().unwrap());
+        a.copy_from_slice(&x.to_ne_bytes());
+    }
+    for (a, b) in p.into_remainder().iter_mut().zip(c.remainder()) {
+        *a ^= *b;
+    }
 }
 
 impl VulkanSession {
@@ -157,6 +173,7 @@ impl VulkanSession {
             command_pools: HashMap::new(),
             command_buffers: HashMap::new(),
             fences: HashMap::new(),
+            last_frames: HashMap::new(),
         }
     }
 
@@ -2827,6 +2844,7 @@ impl VulkanSession {
             }
             Request::DestroySwapchain { swapchain_id } => {
                 let dev = self.device()?.clone();
+                self.last_frames.remove(&swapchain_id);
                 if let Some(sw) = self.swapchains.remove(&swapchain_id) {
                     unsafe {
                         for (buf, mem, _, _) in sw.staging_buffers {
@@ -3046,6 +3064,31 @@ impl VulkanSession {
                     );
                 }
 
+                static FRAME_DELTA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let delta_on = *FRAME_DELTA.get_or_init(|| {
+                    std::env::var("VKREMOTE_FRAME_DELTA").map_or(false, |v| v != "0")
+                });
+                if delta_on {
+                    if let Some(prev) = self.last_frames.get_mut(&params.swapchain_id) {
+                        if prev.len() == data.len() {
+                            // prev becomes the delta; data becomes the new reference.
+                            xor_delta_in_place(prev, &data);
+                            let delta = std::mem::replace(prev, data);
+                            return Ok(Response::QueuePresentDelta {
+                                result: 0,
+                                frame: FramePacket {
+                                    swapchain_id: params.swapchain_id,
+                                    image_index: params.image_index,
+                                    width,
+                                    height,
+                                    format,
+                                    data: delta,
+                                },
+                            });
+                        }
+                    }
+                    self.last_frames.insert(params.swapchain_id, data.clone());
+                }
                 Ok(Response::QueuePresentResult {
                     result: 0,
                     frame: Some(FramePacket {
@@ -3641,5 +3684,27 @@ impl SessionHandler {
             SessionHandler::Vulkan(v) => v.handle_request(req),
             SessionHandler::Mock(m) => m.handle_request(req),
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_delta_tests {
+    use super::xor_delta_in_place;
+
+    #[test]
+    fn xor_delta_round_trips_and_zeroes_unchanged_bytes() {
+        let prev_frame: Vec<u8> = (0..1003u32).map(|i| (i * 7) as u8).collect();
+        let mut cur_frame = prev_frame.clone();
+        cur_frame[5] ^= 0xFF;
+        cur_frame[1001] = 42;
+
+        let mut delta = prev_frame.clone();
+        xor_delta_in_place(&mut delta, &cur_frame);
+        assert_eq!(delta.iter().filter(|&&b| b != 0).count(), 2);
+
+        // Client side: reference XOR delta == current frame.
+        let mut rebuilt = prev_frame.clone();
+        xor_delta_in_place(&mut rebuilt, &delta);
+        assert_eq!(rebuilt, cur_frame);
     }
 }

@@ -4,6 +4,7 @@ pub mod dispatch;
 pub mod entry;
 pub mod manifest;
 pub mod perf;
+pub mod shadow;
 
 pub use abi::*;
 pub use client::*;

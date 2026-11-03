@@ -288,7 +288,7 @@ pub struct AllocationInfo {
     pub size: u64,
     pub memory_type_index: u32,
     pub is_host_visible: bool,
-    pub shadow_buffer: Option<Box<[u8]>>,
+    pub shadow_buffer: Option<crate::shadow::ShadowBuffer>,
     pub mapped_range: Option<(u64, u64)>, // offset, size
     pub has_been_mapped: bool,
 }
@@ -468,8 +468,18 @@ impl Client {
             | Request::CreatePipelineLayout { .. }
             | Request::AllocateDescriptorSets { .. }
             | Request::CreateRenderPass { .. }
+            // Client-assigned pipeline ids; the reply is only logged. Blender
+            // compiles pipelines lazily, ~15-50 per frame while warming up.
+            | Request::CreateGraphicsPipelines { .. }
+            // Replies ignored (client computes the image index / uses own ids); the
+            // server still executes them in order before the next synchronous call.
+            | Request::AcquireNextImage { .. }
+            | Request::BindImageMemory { .. }
+            | Request::ResetFences { .. }
+            | Request::CreateDescriptorPool { .. }
             | Request::CommandBatch { .. } => true,
-            Request::CreateBuffer { .. } => {
+            // Same opt-in as CreateBuffer: deferring hides creation failures.
+            Request::CreateBuffer { .. } | Request::CreateImage { .. } => {
                 static BATCH_CREATE: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 static INIT: std::sync::Once = std::sync::Once::new();
@@ -533,6 +543,49 @@ impl Client {
     #[inline]
     pub fn flush_destructions(&self) -> Result<(), ProtocolError> {
         self.flush_deferred_commands()
+    }
+
+    /// `VKREMOTE_ASYNC_SUBMIT=1`: vkQueueSubmit queues the submit instead of waiting.
+    pub fn async_submit() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VKREMOTE_ASYNC_SUBMIT").map_or(false, |v| v != "0"))
+    }
+
+    /// Queue a request without waiting; it is sent in order ahead of the next
+    /// synchronous request (or when the queue reaches 512 entries).
+    pub fn defer_request(&self, req: Request) -> Result<(), ProtocolError> {
+        let to_flush = {
+            let mut guard = self.pending_destructions.lock().unwrap();
+            guard.push(req);
+            // Bound one batch message: flush early once queued memory uploads
+            // exceed 16 MiB (each WriteMemoryRanges can carry ~2 MiB).
+            let queued_bytes: usize = guard
+                .iter()
+                .map(|r| match r {
+                    Request::WriteMemoryRanges { diffs } => {
+                        diffs.iter().map(|d| d.data.len()).sum::<usize>()
+                    }
+                    _ => 0,
+                })
+                .sum();
+            if guard.len() < 512 && queued_bytes < 16 * 1024 * 1024 {
+                return Ok(());
+            }
+            std::mem::take(&mut *guard)
+        };
+        let mut flat = Vec::new();
+        for r in to_flush {
+            match r {
+                Request::CommandBatch { commands } => flat.extend(commands),
+                other => flat.push(other),
+            }
+        }
+        for chunk in flat.chunks(512) {
+            let _ = self.transport.roundtrip(&Request::CommandBatch {
+                commands: chunk.to_vec(),
+            })?;
+        }
+        Ok(())
     }
 
     pub fn send_request(&self, req: Request) -> Result<Response, ProtocolError> {
@@ -815,7 +868,7 @@ impl Client {
         is_host_visible: bool,
     ) {
         let shadow_buffer = if is_host_visible {
-            Some(vec![0u8; size as usize].into_boxed_slice())
+            Some(crate::shadow::ShadowBuffer::new(size as usize))
         } else {
             None
         };
@@ -890,8 +943,18 @@ impl Client {
         for (&alloc_id, alloc) in guard.iter_mut() {
             if alloc.is_host_visible && alloc.has_been_mapped {
                 if let Some(shadow) = &alloc.shadow_buffer {
-                    crate::perf::DIRTY_SCAN_BYTES.add(shadow.len() as u64);
-                    let diffs = tracker.compute_dirty_chunks(alloc_id, shadow);
+                    let chunk = vkremote_wire::sync::CHUNK_SIZE;
+                    let diffs = match shadow.dirty_chunks(chunk) {
+                        // OS write tracking: hash only chunks the app touched.
+                        Some(offsets) => {
+                            crate::perf::DIRTY_SCAN_BYTES.add((offsets.len() * chunk) as u64);
+                            tracker.compute_dirty_chunks_at(alloc_id, shadow, &offsets)
+                        }
+                        None => {
+                            crate::perf::DIRTY_SCAN_BYTES.add(shadow.len() as u64);
+                            tracker.compute_dirty_chunks(alloc_id, shadow)
+                        }
+                    };
                     all_diffs.extend(diffs);
                 }
             }

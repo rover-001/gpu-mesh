@@ -134,6 +134,16 @@ pub unsafe extern "system" fn vkQueueSubmit(
     // Keep each request bounded even when wgpu initializes several large arenas.
     // Individual diff chunks are 64 KiB; 32 chunks remain well below the wire cap.
     for batch in dirty_memory.chunks(32) {
+        if crate::client::Client::async_submit() {
+            // Queued ahead of the (also queued) QueueSubmit, preserving order.
+            if let Err(e) = q.client.defer_request(Request::WriteMemoryRanges {
+                diffs: batch.to_vec(),
+            }) {
+                tracing::error!("Memory upload failed: {}", e);
+                return ash::vk::Result::ERROR_DEVICE_LOST;
+            }
+            continue;
+        }
         match q.client.send_request(Request::WriteMemoryRanges {
             diffs: batch.to_vec(),
         }) {
@@ -151,6 +161,22 @@ pub unsafe extern "system" fn vkQueueSubmit(
         fence_id,
         dirty_memory: Vec::new(),
     };
+
+    if crate::client::Client::async_submit() {
+        // Ordered with the next synchronous request (present / fence wait), which
+        // the server processes after this submit. Failures are logged server-side.
+        if let Err(e) = q.client.defer_request(req) {
+            tracing::error!("QueueSubmit network error: {}", e);
+            return ash::vk::Result::ERROR_DEVICE_LOST;
+        }
+        for (id, value) in timeline_signals {
+            let result = q.client.signal_timeline(id, value);
+            if result != ash::vk::Result::SUCCESS {
+                return result;
+            }
+        }
+        return ash::vk::Result::SUCCESS;
+    }
 
     match q.client.send_request(req) {
         Ok(Response::Success) => {

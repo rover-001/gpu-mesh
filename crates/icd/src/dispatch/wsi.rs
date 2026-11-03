@@ -56,6 +56,21 @@ unsafe fn blit_to_window(hwnd: ash::vk::HWND, frame: &FramePacket) {
         ) -> i32;
     }
 
+    // GDI 32-bit DIBs are BGRX. RGBA swapchains (Blender picks R8G8B8A8_UNORM)
+    // would show red and blue swapped, so swizzle into a BGRA copy.
+    let swizzled;
+    let pixels: &[u8] = match frame.format {
+        vkremote_wire::types::Format::R8G8B8A8Unorm | vkremote_wire::types::Format::R8G8B8A8Srgb => {
+            let mut v = frame.data.clone();
+            for px in v.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            swizzled = v;
+            &swizzled
+        }
+        _ => &frame.data,
+    };
+
     let hdc = GetDC(hwnd as *mut std::ffi::c_void);
     if !hdc.is_null() {
         let mut bmi: BITMAPINFO = std::mem::zeroed();
@@ -80,7 +95,7 @@ unsafe fn blit_to_window(hwnd: ash::vk::HWND, frame: &FramePacket) {
             0,
             frame.width as i32,
             frame.height as i32,
-            frame.data.as_ptr() as *const std::ffi::c_void,
+            pixels.as_ptr() as *const std::ffi::c_void,
             &bmi,
             0,          // DIB_RGB_COLORS
             0x00CC0020, // SRCCOPY
@@ -91,6 +106,44 @@ unsafe fn blit_to_window(hwnd: ash::vk::HWND, frame: &FramePacket) {
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 unsafe fn blit_to_window(_hwnd: ash::vk::HWND, _frame: &FramePacket) {}
+
+/// Last full frame per swapchain, the reference for XOR frame deltas.
+static LAST_FRAMES: std::sync::Mutex<Option<std::collections::HashMap<u64, Vec<u8>>>> =
+    std::sync::Mutex::new(None);
+
+fn remember_frame(swapchain_id: u64, data: Vec<u8>) {
+    LAST_FRAMES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(swapchain_id, data);
+}
+
+/// Turn a delta frame into the full frame using the stored reference.
+fn apply_frame_delta(frame: &mut FramePacket) -> bool {
+    let prev = LAST_FRAMES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .remove(&frame.swapchain_id);
+    let Some(mut full) = prev else { return false };
+    if full.len() != frame.data.len() {
+        return false;
+    }
+    {
+        let mut a = full.chunks_exact_mut(8);
+        let mut b = frame.data.chunks_exact(8);
+        for (x, y) in (&mut a).zip(&mut b) {
+            let v = u64::from_ne_bytes(x.try_into().unwrap()) ^ u64::from_ne_bytes(y.try_into().unwrap());
+            x.copy_from_slice(&v.to_ne_bytes());
+        }
+        for (x, y) in a.into_remainder().iter_mut().zip(b.remainder()) {
+            *x ^= *y;
+        }
+    }
+    frame.data = full;
+    true
+}
 
 fn present_frame_to_window(surface: &SurfaceInfo, frame: &FramePacket) -> ash::vk::Result {
     let _perf_span = crate::perf::Span::new(&crate::perf::BLIT_US);
@@ -604,6 +657,9 @@ pub unsafe extern "system" fn vkDestroySwapchainKHR(
     if device.is_null() || swapchain.is_null() {
         return;
     }
+    if let Some(map) = LAST_FRAMES.lock().unwrap().as_mut() {
+        map.remove(&swapchain.as_raw());
+    }
     let dev = DeviceDispatchable::from_vk(device);
     let sc_id = swapchain.as_raw();
 
@@ -748,6 +804,25 @@ pub unsafe extern "system" fn vkQueuePresentKHR(
                                 item_result = present_frame_to_window(&surface, &frame_data);
                             }
                         }
+                        // Reference for a following QueuePresentDelta.
+                        remember_frame(frame_data.swapchain_id, frame_data.data);
+                    }
+                }
+                Ok(Response::QueuePresentDelta { result, mut frame }) => {
+                    if result != 0 {
+                        item_result = ash::vk::Result::from_raw(result);
+                    }
+                    if apply_frame_delta(&mut frame) {
+                        if let Some(surface_id) =
+                            q.client.get_swapchain_surface_id(sc_handle.as_raw())
+                        {
+                            if let Some(surface) = q.client.get_surface(surface_id) {
+                                item_result = present_frame_to_window(&surface, &frame);
+                            }
+                        }
+                        remember_frame(frame.swapchain_id, frame.data);
+                    } else {
+                        tracing::error!("QueuePresentDelta without a matching reference frame");
                     }
                 }
                 Ok(Response::Success) => {}

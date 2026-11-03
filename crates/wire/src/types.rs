@@ -425,6 +425,8 @@ pub struct BufferCopyData {
 pub struct MemoryChunkDiff {
     pub allocation_id: u64,
     pub offset: u64,
+    // serde_bytes: same postcard bytes as Vec<u8>, but one memcpy instead of per-byte serde.
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 // ============================================================================
@@ -2108,6 +2110,8 @@ pub struct FramePacket {
     pub width: u32,
     pub height: u32,
     pub format: Format,
+    // serde_bytes: same postcard bytes as Vec<u8>, but one memcpy instead of per-byte serde.
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
@@ -2673,5 +2677,13 @@ pub enum Response {
         row_pitch: u64,
         array_pitch: u64,
         depth_pitch: u64,
+    },
+    /// Like `QueuePresentResult`, but `frame.data` is the XOR of this frame with the
+    /// previous frame sent for the same swapchain (same size). Unchanged pixels are
+    /// zero, so zstd shrinks a mostly static UI frame from ~1 MB to a few KB.
+    /// Only sent when the server runs with `VKREMOTE_FRAME_DELTA=1`.
+    QueuePresentDelta {
+        result: VkResultCode,
+        frame: FramePacket,
     },
 }
