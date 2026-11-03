@@ -1,0 +1,10 @@
+[package]
+name = "remote-gpu-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vkremote-wire = { path = "../../crates/wire" }
+ash = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

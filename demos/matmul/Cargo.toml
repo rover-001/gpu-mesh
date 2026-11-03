@@ -1,0 +1,12 @@
+[package]
+name = "matmul"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "matmul"
+path = "src/main.rs"
+
+[dependencies]
+ash = "0.38"
+anyhow = { workspace = true }

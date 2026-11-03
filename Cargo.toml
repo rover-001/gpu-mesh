@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wire",
+    "crates/icd",
+    "crates/server",
+    "tools/probe",
+    "demos/vecadd",
+    "demos/matmul",
+    "demos/mandelbrot",
+    "tools/remote-gpu-service",
+    "xtask", "apps/gpu-mesh",
+]
+
+[workspace.dependencies]
+ash = "0.38"
+tokio = { version = "1.38", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.0", features = ["alloc"] }
+zstd = "0.13"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+thiserror = "1.0"
+byteorder = "1.5"
+clap = { version = "4.5", features = ["derive"] }

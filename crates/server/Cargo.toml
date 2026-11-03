@@ -1,0 +1,16 @@
+[package]
+name = "vkremote-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vkremote-wire = { path = "../wire" }
+ash = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

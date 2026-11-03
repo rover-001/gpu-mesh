@@ -1,0 +1,9 @@
+/target
+.heald
+AGENTS.md
+*.txt
+.horizon-cache/
+saves/
+servers.dat
+plan.md
+

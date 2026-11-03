@@ -1,0 +1,12 @@
+[package]
+name = "vkremote-probe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "probe"
+path = "src/main.rs"
+
+[dependencies]
+ash = { workspace = true }
+anyhow = { workspace = true }

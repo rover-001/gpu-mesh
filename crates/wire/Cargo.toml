@@ -1,0 +1,14 @@
+[package]
+name = "vkremote-wire"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+postcard = { workspace = true }
+zstd = { workspace = true }
+xxhash-rust = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+byteorder = { workspace = true }
+tokio = { workspace = true }
