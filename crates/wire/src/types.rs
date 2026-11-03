@@ -2604,6 +2604,12 @@ pub enum Request {
         mip_level: u32,
         array_layer: u32,
     },
+    /// Per-connection opt-ins sent by newer clients right after the handshake.
+    /// Old clients never send it, so they keep receiving full frames.
+    SetSessionOptions {
+        /// Client understands `Response::QueuePresentDelta`.
+        frame_delta: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

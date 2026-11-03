@@ -155,6 +155,12 @@ impl TcpTransport {
                 eprintln!("[vkremote-icd] Handshake failed with {}: {}", addr, e);
                 e
             })?;
+            // Opt into XOR frame deltas for this connection (VKREMOTE_FRAME_DELTA=1).
+            // Only sent when asked for, so servers predating the request are unaffected.
+            if std::env::var("VKREMOTE_FRAME_DELTA").map_or(false, |v| v != "0") {
+                write_msg_sync(&mut s, &Request::SetSessionOptions { frame_delta: true })?;
+                let _: Response = read_msg_sync_with_len(&mut s, DEFAULT_MAX_FRAME_SIZE)?.0;
+            }
             eprintln!(
                 "[vkremote-icd] Successfully connected to remote server at {}!",
                 self.server_addr

@@ -129,6 +129,8 @@ pub struct VulkanSession {
     fences: HashMap<u64, vk::Fence>,
     /// Last frame sent per swapchain, for XOR delta presentation.
     last_frames: HashMap<u64, Vec<u8>>,
+    /// Client opted into QueuePresentDelta via Request::SetSessionOptions.
+    client_frame_delta: bool,
 }
 
 /// XOR `cur` into `prev` (so `prev` becomes the delta) and return it, while
@@ -174,6 +176,7 @@ impl VulkanSession {
             command_buffers: HashMap::new(),
             fences: HashMap::new(),
             last_frames: HashMap::new(),
+            client_frame_delta: false,
         }
     }
 
@@ -1849,6 +1852,10 @@ impl VulkanSession {
                     memory_type_bits: reqs.memory_type_bits,
                 }))
             }
+            Request::SetSessionOptions { frame_delta } => {
+                self.client_frame_delta = frame_delta;
+                Ok(Response::Success)
+            }
             Request::GetImageSubresourceLayout {
                 image_id,
                 aspect_mask,
@@ -3065,9 +3072,10 @@ impl VulkanSession {
                 }
 
                 static FRAME_DELTA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                let delta_on = *FRAME_DELTA.get_or_init(|| {
-                    std::env::var("VKREMOTE_FRAME_DELTA").map_or(false, |v| v != "0")
-                });
+                let delta_on = self.client_frame_delta
+                    || *FRAME_DELTA.get_or_init(|| {
+                        std::env::var("VKREMOTE_FRAME_DELTA").map_or(false, |v| v != "0")
+                    });
                 if delta_on {
                     if let Some(prev) = self.last_frames.get_mut(&params.swapchain_id) {
                         if prev.len() == data.len() {
@@ -3473,6 +3481,7 @@ impl MockSession {
                 memory_type_bits: 0x3,
             },
             Request::BindImageMemory { .. } => Response::Success,
+            Request::SetSessionOptions { .. } => Response::Success,
             Request::GetImageSubresourceLayout { .. } => Response::ImageSubresourceLayout {
                 offset: 0,
                 size: 65536,
