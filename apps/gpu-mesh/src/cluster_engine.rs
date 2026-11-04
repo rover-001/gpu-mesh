@@ -361,7 +361,7 @@ impl ClusterEngineManager {
             "-sm".to_string(),
             "layer".to_string(),
             "--port".to_string(),
-            "8080".to_string(),
+            "18081".to_string(),
             "--host".to_string(),
             "0.0.0.0".to_string(),
             "-fa".to_string(),
@@ -504,7 +504,7 @@ impl ClusterEngineManager {
     pub fn kill_orphaned_engines() -> usize {
         if cfg!(target_os = "windows") {
             let ps = "$p = Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" | \
-                Where-Object { $_.CommandLine -match '--port 8080' -and $_.CommandLine -match 'llama-webui' }; \
+                Where-Object { $_.CommandLine -match '--port (8080|18081)' -and $_.CommandLine -match 'llama-webui' }; \
                 $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; ($p | Measure-Object).Count";
             return Command::new("powershell")
                 .args(["-NoProfile", "-Command", ps])
@@ -523,7 +523,7 @@ impl ClusterEngineManager {
                     .map(|a| String::from_utf8_lossy(a).to_string())
                     .collect();
                 let is_llama = args.first().map_or(false, |a| a.ends_with("/llama-server"));
-                let port_8080 = args.windows(2).any(|w| w[0] == "--port" && w[1] == "8080");
+                let port_8080 = args.windows(2).any(|w| w[0] == "--port" && (w[1] == "8080" || w[1] == "18081"));
                 let ours = args.iter().any(|a| a.ends_with("llama-webui"));
                 if is_llama && port_8080 && ours {
                     let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();

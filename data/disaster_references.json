@@ -1,0 +1,75 @@
+{
+  "reviewed_on": "2026-11-04",
+  "description": "Concise source summaries for offline grounding; not a complete operational response manual.",
+  "entries": [
+    {
+      "id": "ics",
+      "terms": [
+        "ics",
+        "incident command",
+        "incident management",
+        "command protocols"
+      ],
+      "text": "ICS stands for Incident Command System. It provides a common structure for managing an incident across organizations. Its five functional areas are Command, Operations, Planning, Logistics, and Finance/Administration. An Emergency Operations Center (EOC) supports coordination and is not the on-scene incident command post.",
+      "source": "https://training.fema.gov/EMIWeb/IS/IS700b/Handouts/National_Incident_Management%20System_Third%20Edition_October_2017.pdf"
+    },
+    {
+      "id": "drill",
+      "terms": [
+        "evacuation drill",
+        "evacuation exercise",
+        "practice evacuation"
+      ],
+      "text": "An evacuation drill is a practice exercise to rehearse safe evacuation procedures, routes, meeting places, communication and accounting for participants. Practicing an emergency plan helps people prepare before an emergency.",
+      "source": "https://www.army.mil/ready"
+    },
+    {
+      "id": "earthquake",
+      "terms": [
+        "earthquake",
+        "seismic",
+        "aftershock",
+        "earthquakes",
+        "aftershocks"
+      ],
+      "text": "During earthquake shaking, drop, cover, and hold on. Expect aftershocks and protect yourself again when shaking occurs. After shaking stops, avoid damaged buildings, damaged power lines and other hazards; follow local emergency instructions. These references do not specify a complete first-hour triage or incident action plan for a particular city.",
+      "source": "https://www.cdc.gov/earthquakes/safety/stay-safe-after-an-earthquake.html"
+    },
+    {
+      "id": "tsunami",
+      "terms": [
+        "tsunami",
+        "offshore",
+        "coastal seismic"
+      ],
+      "text": "A strong or long earthquake, unusual ocean behavior, or a loud ocean roar can be natural tsunami warnings. Near the water after an earthquake, move off the beach to high ground or inland as soon as it is safe. Protect yourself from shaking first. Do not wait for a formal warning when natural warning signs occur. Follow official evacuation routes and local instructions.",
+      "source": "https://www.weather.gov/safety/tsunami-during"
+    },
+    {
+      "id": "flood",
+      "terms": [
+        "flood",
+        "dam",
+        "spillway",
+        "inundation",
+        "flooding",
+        "floods"
+      ],
+      "text": "Do not walk or drive into floodwater or around road barricades. Turn around and find a safe route. Follow evacuation instructions from local authorities. Site-specific dam failure arrival times, flow rates, safe elevations and routes require the dam emergency action plan and local engineering information; they cannot be inferred from gate opening percentage alone.",
+      "source": "https://www.weather.gov/safety/flood-turn-around-dont-drown"
+    },
+    {
+      "id": "chemical",
+      "terms": [
+        "chlorine",
+        "chemical",
+        "hazmat",
+        "gas leak",
+        "plume",
+        "chemicals"
+      ],
+      "text": "In a chemical emergency, get away from the affected area, remove contamination and get medical or emergency help. Follow local instructions about evacuation or sheltering. Chlorine exposure calls for fresh air and prompt help. These notes do not establish a safe spill perimeter or plume model: do not invent distances, exposure limits, or treatment protocols.",
+      "source": "https://www.cdc.gov/chemical-emergencies/response/index.html"
+    }
+  ]
+}

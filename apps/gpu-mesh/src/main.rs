@@ -1,4 +1,5 @@
 mod cluster_engine;
+mod disaster_grounding;
 mod mesh;
 mod net_setup;
 mod network;
@@ -2147,27 +2148,15 @@ impl Render for GpuMeshApp {
                                                                             Ok(session) => {
                                                                                 let host = endpoint.split(':').next().unwrap_or("127.0.0.1").to_string();
                                                                                 let target_addr = format!("{}:18080", host);
-                                                                                let (proxy_tx, mut proxy_rx) = tokio::sync::oneshot::channel::<()>();
-                                                                                tokio_rt().spawn(async move {
-                                                                                    let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:8080").await else {
-                                                                                        eprintln!("[gpu-mesh] Proxy bind on 127.0.0.1:8080 failed");
+                                                                                let proxy_tx = match disaster_grounding::start_proxy(target_addr, disaster_grounding::applies_to(&model)) {
+                                                                                    Ok(tx) => tx,
+                                                                                    Err(error) => {
+                                                                                        let mut s = state_bg.lock();
+                                                                                        s.engine_status = EngineStatus::Failed(error.clone());
+                                                                                        s.status_message = error;
                                                                                         return;
-                                                                                    };
-                                                                                    loop {
-                                                                                        tokio::select! {
-                                                                                            _ = &mut proxy_rx => break,
-                                                                                            res = listener.accept() => {
-                                                                                                let Ok((mut client, _)) = res else { continue };
-                                                                                                let target = target_addr.clone();
-                                                                                                tokio::spawn(async move {
-                                                                                                    if let Ok(mut server) = tokio::net::TcpStream::connect(&target).await {
-                                                                                                        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
-                                                                                                    }
-                                                                                                });
-                                                                                            }
-                                                                                        }
                                                                                     }
-                                                                                });
+                                                                                };
                                                                                 let mut s = state_bg.lock();
                                                                                 s.web_proxy_stop_tx = Some(proxy_tx);
                                                                                 s.remote_session = Some(Arc::new(tokio::sync::Mutex::new(session)));
@@ -2190,8 +2179,19 @@ impl Render for GpuMeshApp {
                                                                     let res = ClusterEngineManager::spawn_server(&rpc_target, &model, local_vram, &remote_vram_list);
                                                                     match res {
                                                                         Ok(pid) => {
+                                                                            let proxy_tx = match disaster_grounding::start_proxy("127.0.0.1:18081".to_string(), disaster_grounding::applies_to(&model)) {
+                                                                                Ok(tx) => tx,
+                                                                                Err(error) => {
+                                                                                    ClusterEngineManager::stop_server(pid);
+                                                                                    let mut s = state_bg.lock();
+                                                                                    s.engine_status = EngineStatus::Failed(error.clone());
+                                                                                    s.status_message = error;
+                                                                                    return;
+                                                                                }
+                                                                            };
                                                                             {
                                                                                 let mut s = state_bg.lock();
+                                                                                s.web_proxy_stop_tx = Some(proxy_tx);
                                                                                 s.engine_pid = Some(pid);
                                                                             }
                                                                             

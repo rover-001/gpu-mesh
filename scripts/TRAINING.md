@@ -67,3 +67,25 @@ Verification results are in `artifacts/training-validation/`. The current
 20-example corpus and 0.5B model still fail answer-quality checks despite
 improved heldout loss. Successful training/export is not evidence of accurate
 emergency advice. The Windows report records actual base/adapter answers.
+
+### Offline disaster reference answers
+
+The small Qwen 0.5B model did not reliably answer even its training questions.
+For that model, the app's chat endpoint now routes matching disaster questions to
+bundled source summaries in `data/disaster_references.json`. These answers start
+with **Offline reference summary**, include official source links, and carry
+`rgpu_response_mode: offline_reference` in the API response. No network lookup is
+made at runtime. This is reference retrieval, not evidence of learned model quality.
+
+The initial catalog covers incident command, evacuation drills, earthquakes,
+tsunamis, flood precautions, and chemical-emergency basics. Unsupported disaster
+questions receive an explicit insufficient-reference answer. It does not supply
+site-specific response plans, spill distances, evacuation routes, or medical
+triage protocols. General chat, tool calls, other models and raw `/completion`
+requests continue to use the model. Streaming chat responses remain OpenAI SSE.
+
+Both local and peer chat use port 8080. Local llama-server now listens behind
+the app on port 18081; peer worker llama-server continues to use 18080. Restart
+inference after rebuilding to apply the new routing. Existing weights and best
+checkpoint selection are preserved. Lower validation loss alone still does not
+establish that a trained model produces reliable disaster-response answers.
