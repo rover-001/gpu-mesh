@@ -19,8 +19,9 @@ import sys
 import time
 import uuid
 
-BASE_MODEL = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
-BASE_GGUF = "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"
+BASE_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+BASE_GGUF = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+SUPPORTED_MODELS = {BASE_MODEL: BASE_GGUF, "Qwen/Qwen2.5-Coder-0.5B-Instruct": "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"}
 FORMAT_VERSION = 1
 
 
@@ -180,8 +181,8 @@ def output_lock(output):
 
 
 def export_adapter(output, checkpoint, metadata, llama_cpp_dir):
-    if metadata["base_model"] != BASE_MODEL:
-        raise ValueError("Automatic app activation currently supports only the Qwen 0.5B base")
+    if metadata["base_model"] not in SUPPORTED_MODELS:
+        raise ValueError("Automatic app activation requires a supported, matching Qwen base")
     destination = Path(checkpoint) / "adapter.gguf"
     if not destination.exists():
         converter = Path(llama_cpp_dir) / "convert_lora_to_gguf.py"
@@ -189,6 +190,10 @@ def export_adapter(output, checkpoint, metadata, llama_cpp_dir):
             raise ValueError(f"LoRA converter missing: {converter}; set --llama-cpp-dir")
         temporary = destination.with_name(".adapter-" + uuid.uuid4().hex + ".gguf")
         base_path = metadata.get("base_model_path")
+        if not base_path or not Path(base_path).is_dir():
+            portable = (Path("C:/rgpu/training-base") if os.name == "nt" else Path.home() / ".cache/gpu-mesh/training-base") / metadata["base_model"].split("/")[-1]
+            if portable.is_dir():
+                base_path = str(portable)
         base_args = ["--base", base_path] if base_path and Path(base_path).is_dir() else ["--base-model-id", metadata["base_model"]]
         subprocess.run([sys.executable, str(converter), *base_args,
                         "--outfile", str(temporary), "--outtype", "f16", str(checkpoint)], check=True)
@@ -200,8 +205,8 @@ def export_adapter(output, checkpoint, metadata, llama_cpp_dir):
         if stream.read(4) != b"GGUF":
             raise ValueError("Existing immutable adapter is not a GGUF file")
     atomic_json(Path(output) / "active_adapter.json", {
-        "format_version": FORMAT_VERSION, "base_model": BASE_MODEL,
-        "base_gguf_filename": BASE_GGUF,
+        "format_version": FORMAT_VERSION, "base_model": metadata["base_model"],
+        "base_gguf_filename": SUPPORTED_MODELS[metadata["base_model"]],
         "adapter_file": f"{Path(checkpoint).name}/adapter.gguf",
         "adapter_sha256": file_sha256(destination),
     })
@@ -231,8 +236,8 @@ def _train(args):
     checkpoint, previous = read_checkpoint(resume) if resume else (None, None)
     model_id = resolve_model(args.model)
     model_source = args.base_model or model_id
-    cached_base = Path("C:/rgpu/training-base/Qwen2.5-Coder-0.5B-Instruct") if os.name == "nt" else Path.home() / ".cache/gpu-mesh/training-base/Qwen2.5-Coder-0.5B-Instruct"
-    if not args.base_model and model_id == BASE_MODEL and (cached_base / "config.json").is_file():
+    cached_base = (Path("C:/rgpu/training-base") if os.name == "nt" else Path.home() / ".cache/gpu-mesh/training-base") / model_id.split("/")[-1]
+    if not args.base_model and model_id in SUPPORTED_MODELS and (cached_base / "config.json").is_file():
         model_source = str(cached_base)
     samples = load_dataset(args.data)
     data_hash = file_sha256(args.data)
@@ -240,8 +245,12 @@ def _train(args):
     if previous:
         identity = (model_id, data_hash, args.max_length, args.seed)
         saved_identity = (previous["base_model"], previous["dataset_sha256"], previous["max_length"], previous["seed"])
-        if identity != saved_identity or train_ids != previous["train_indices"] or validation_ids != previous["validation_indices"]:
-            raise ValueError("Resume model/dataset/tokenization/split does not match checkpoint; refusing cold restart")
+        if getattr(args, "fine_tune_data", False):
+            if model_id != previous["base_model"]:
+                raise ValueError("New-data fine-tuning must preserve the checkpoint base model")
+            previous = dict(previous, completed_epochs=0, epoch_step=0)
+        elif identity != saved_identity or train_ids != previous["train_indices"] or validation_ids != previous["validation_indices"]:
+            raise ValueError("Resume model/dataset/tokenization/split does not match checkpoint; use --fine-tune-data explicitly for a new corpus")
     if (output / "best.json").exists():
         _, existing = read_checkpoint(output / "best.json")
         if (existing["base_model"], existing["dataset_sha256"], existing["max_length"], existing["seed"]) != (model_id, data_hash, args.max_length, args.seed):
@@ -305,7 +314,7 @@ def _train(args):
                 tokens += count
         return total_loss / tokens
     baseline = evaluate()
-    baseline_limit = min(baseline, previous["baseline_validation_loss"]) if previous else baseline
+    baseline_limit = baseline if getattr(args, "fine_tune_data", False) else (min(baseline, previous["baseline_validation_loss"]) if previous else baseline)
     best_loss = min(baseline_limit, existing["validation_loss"]) if existing else baseline_limit
     print(f"[VALIDATION] Measured starting heldout loss: {baseline:.6f}; device={device}", flush=True)
     completed = previous["completed_epochs"] if previous else 0
@@ -382,26 +391,29 @@ def _train(args):
 
 def parse_args(argv=None):
     root = Path(__file__).resolve().parent.parent
-    output = Path("C:/rgpu/models/checkpoints") if os.name == "nt" else Path.home() / ".cache/gpu-mesh/models/checkpoints"
+    output = Path("C:/rgpu/models/checkpoints-disaster-1.5b") if os.name == "nt" else Path.home() / ".cache/gpu-mesh/models/checkpoints-disaster-1.5b"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=BASE_MODEL)
     parser.add_argument("--base-model", default=None, help="Local original HF float weights; preserves --model identity")
-    parser.add_argument("--data", default=str(root / "data/disaster_management_train.jsonl"))
+    parser.add_argument("--data", default=str(root / "data/disaster_management_verified.jsonl"))
     parser.add_argument("--output", default=str(output))
     parser.add_argument("--epochs", type=int, default=2, help="Additional epochs, including the unfinished epoch on resume")
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--lora-r", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument("--max-length", type=int, default=384)
     parser.add_argument("--max-steps", type=int, default=None, help="Limit optimizer steps in this invocation for smoke testing")
     parser.add_argument("--mesh-server", default=None, help="Compatibility only: training runs on this host, not the inference server")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--fine-tune-data", action="store_true", help="Continue existing learned adapter on an explicitly changed dataset; reset epoch cursor, preserve tensors and optimizer")
     parser.add_argument("--no-color", action="store_true")
     parser.add_argument("--export-gguf", "--export", action="store_true")
     parser.add_argument("--export-only", action="store_true", help="Export existing validated best without training")
     parser.add_argument("--llama-cpp-dir", default=os.environ.get("LLAMA_CPP_DIR", str(root / "tools/llama.cpp")))
     args = parser.parse_args(argv)
+    if args.fine_tune_data and not (args.checkpoint or args.resume):
+        parser.error("--fine-tune-data requires --checkpoint or --resume; learned weights must be preserved")
     if args.epochs < 1 or args.lora_r < 1 or args.max_length < 2 or (args.max_steps is not None and args.max_steps < 1):
         parser.error("epochs/rank/max-steps must be positive; max-length must be at least 2")
     if args.lr is not None and (not math.isfinite(args.lr) or args.lr <= 0):

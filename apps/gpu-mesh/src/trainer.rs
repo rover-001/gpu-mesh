@@ -96,6 +96,13 @@ fn add_training_arguments(command: &mut Command, epochs: usize, lora_r: usize, r
     if resume {
         command.arg("--resume");
     }
+    command.args(["--model", "Qwen/Qwen2.5-1.5B-Instruct", "--data", "data/disaster_management_verified.jsonl", "--max-length", "384"]);
+    let output = if cfg!(target_os = "windows") {
+        std::path::PathBuf::from("C:/rgpu/models/checkpoints-disaster-1.5b")
+    } else {
+        std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/gpu-mesh/models/checkpoints-disaster-1.5b")
+    };
+    command.arg("--output").arg(output);
     command.env("PYTHONUNBUFFERED", "1");
 }
 
@@ -132,19 +139,19 @@ fn peer_training_command(peer: &TrainingPeerConfig, epochs: usize, lora_r: usize
     if peer.root.trim().is_empty() {
         return Err(anyhow!("Training peer checkout path must not be empty"));
     }
-    let arguments = format!("--epochs {epochs} --lora-r {lora_r} --export-gguf{}", if resume { " --resume" } else { "" });
+    let arguments = format!("--model Qwen/Qwen2.5-1.5B-Instruct --data data/disaster_management_verified.jsonl --max-length 384 --epochs {epochs} --lora-r {lora_r} --export-gguf{}", if resume { " --resume" } else { "" });
     match peer.platform.as_str() {
         "linux" => {
             let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
             let python = peer.python.as_deref().unwrap_or(".venv-training/bin/python");
-            Ok(format!("cd {} && {} -u scripts/train_qwen.py {arguments} --llama-cpp-dir tools/llama.cpp", quote(&peer.root), quote(python)))
+            Ok(format!("cd {} && {} -u scripts/train_qwen.py {arguments} --output ~/.cache/gpu-mesh/models/checkpoints-disaster-1.5b --llama-cpp-dir tools/llama.cpp", quote(&peer.root), quote(python)))
         }
         "windows" => {
             let python = peer.python.as_deref().unwrap_or(r".venv-training\Scripts\python.exe");
             if [&peer.root, python].iter().any(|value| value.chars().any(|c| "\"&|<>^%!\r\n".contains(c))) {
                 return Err(anyhow!("Unsupported shell characters in Windows training peer paths"));
             }
-            Ok(format!(r#"cd /d "{}" && "{}" -u scripts/train_qwen.py {arguments} --llama-cpp-dir tools/llama.cpp"#, peer.root, python))
+            Ok(format!(r#"cd /d "{}" && "{}" -u scripts/train_qwen.py {arguments} --output C:/rgpu/models/checkpoints-disaster-1.5b --llama-cpp-dir tools/llama.cpp"#, peer.root, python))
         }
         _ => Err(anyhow!("Training peer platform must be linux or windows")),
     }

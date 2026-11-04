@@ -17,8 +17,8 @@ const MAX_CONTROL_FRAME: u32 = 1024 * 1024;
 const MODEL_CHUNK_SIZE: usize = 1024 * 1024;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-const DISASTER_BASE_MODEL: &str = "Qwen/Qwen2.5-Coder-0.5B-Instruct";
-const DISASTER_GGUF_FILENAME: &str = "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf";
+const DISASTER_BASE_MODEL: &str = "Qwen/Qwen2.5-1.5B-Instruct";
+const DISASTER_GGUF_FILENAME: &str = "qwen2.5-1.5b-instruct-q4_k_m.gguf";
 
 #[derive(serde::Deserialize)]
 struct ActiveAdapter {
@@ -27,6 +27,19 @@ struct ActiveAdapter {
     base_gguf_filename: String,
     adapter_file: String,
     adapter_sha256: String,
+}
+
+pub const DISASTER_CHAT_TEMPLATE: &str = include_str!("../../../data/disaster_model_chat_template.jinja");
+
+fn is_disaster_model(model: &Path) -> bool {
+    model.file_name().and_then(|name| name.to_str()) == Some(DISASTER_GGUF_FILENAME)
+        || model.components().any(|part| part.as_os_str().to_string_lossy().starts_with("checkpoints-disaster-1.5b"))
+}
+
+pub fn configure_disaster_chat(command: &mut Command, model: &Path) {
+    if is_disaster_model(model) {
+        command.args(["--jinja", "--chat-template", DISASTER_CHAT_TEMPLATE, "--repeat-penalty", "1.1"]);
+    }
 }
 
 fn validate_adapter_export(model: &Path, checkpoint_dir: &Path) -> Result<Option<PathBuf>> {
@@ -87,14 +100,14 @@ pub fn trained_adapter_for_model(model: &Path) -> Result<Option<PathBuf>> {
     }
     let mut directories = Vec::new();
     if let Some(parent) = model.parent() {
-        directories.push(parent.join("checkpoints"));
+        directories.push(parent.join("checkpoints-disaster-1.5b"));
     }
-    let cache = get_cache_dir().join("checkpoints");
+    let cache = get_cache_dir().join("checkpoints-disaster-1.5b");
     if !directories.contains(&cache) {
         directories.push(cache);
     }
     if cfg!(target_os = "windows") {
-        let shared = PathBuf::from("C:\\rgpu\\models\\checkpoints");
+        let shared = PathBuf::from("C:\\rgpu\\models\\checkpoints-disaster-1.5b");
         if !directories.contains(&shared) {
             directories.push(shared);
         }
@@ -105,7 +118,7 @@ pub fn trained_adapter_for_model(model: &Path) -> Result<Option<PathBuf>> {
             return Ok(Some(adapter));
         }
     }
-    eprintln!("[gpu-mesh] No validated trained adapter found; using the original Qwen 0.5B base model");
+    eprintln!("[gpu-mesh] No validated trained adapter found; using the original Qwen 1.5B base model");
     Ok(None)
 }
 
@@ -119,6 +132,10 @@ fn same_local_file(left: &Path, right: &Path) -> bool {
 fn worker_configuration_matches(model: &Path, adapter: Option<&Path>, properties: &serde_json::Value, adapters: &serde_json::Value) -> bool {
     let Some(loaded_model) = properties["model_path"].as_str() else { return false };
     if !same_local_file(model, Path::new(loaded_model)) {
+        return false;
+    }
+    if is_disaster_model(model)
+        && properties["chat_template"].as_str().map(str::trim) != Some(DISASTER_CHAT_TEMPLATE.trim()) {
         return false;
     }
     let Some(loaded_adapters) = adapters.as_array() else { return false };
@@ -165,13 +182,13 @@ impl ModelManifest {
         }
     }
 
-    pub fn default_qwen_draft_0_5b() -> Self {
+    pub fn disaster_qwen_1_5b() -> Self {
         Self {
-            name: "Qwen 2.5 0.5B (Disaster Model)".to_string(),
-            hf_repo: "Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF".to_string(),
-            filename: "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf".to_string(),
-            sha256: "1d9614638d18024d0fbb36575a15f1302a3adf044df10345688ec4f6e1c4ff32".to_string(),
-            size: 491400064,
+            name: "Qwen 2.5 1.5B (Disaster Model)".to_string(),
+            hf_repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".to_string(),
+            filename: DISASTER_GGUF_FILENAME.to_string(),
+            sha256: "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e".to_string(),
+            size: 1117320736,
         }
     }
 
@@ -494,6 +511,7 @@ fn spawn_worker_llama(model: &Path, port: u16) -> Result<Child> {
         args.push(webui_path);
     }
 
+    configure_disaster_chat(&mut cmd, model);
     cmd.args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -932,7 +950,7 @@ mod model_resolution_check {
         let models = [
             super::ModelManifest::default_qwen_7b(),
             super::ModelManifest::qwen_14b_coder(),
-            super::ModelManifest::default_qwen_draft_0_5b(),
+            super::ModelManifest::disaster_qwen_1_5b(),
         ];
         for m in models {
             let ui = crate::cluster_engine::ClusterEngineManager::get_model_path_for_manifest(&m);

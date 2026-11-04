@@ -1,0 +1,97 @@
+[
+  {
+    "prompt": "In disaster management, expand the abbreviation ICS.",
+    "required_patterns": [
+      "incident command system"
+    ]
+  },
+  {
+    "prompt": "List all five ICS sections.",
+    "required_patterns": [
+      "command",
+      "operations",
+      "planning",
+      "logistics",
+      "finance"
+    ]
+  },
+  {
+    "prompt": "Explain how an emergency operations center differs from a field command post.",
+    "required_patterns": [
+      "coordina",
+      "scene|site|field|immediate"
+    ]
+  },
+  {
+    "prompt": "Why do people rehearse leaving a building before an emergency?",
+    "required_patterns": [
+      "practice|rehears",
+      "evacuat|exit"
+    ]
+  },
+  {
+    "prompt": "What is the reason for checking who arrived at an evacuation assembly point?",
+    "required_patterns": [
+      "missing|account"
+    ]
+  },
+  {
+    "prompt": "The ground starts shaking. What three protective actions should I take?",
+    "required_patterns": [
+      "drop",
+      "cover",
+      "hold"
+    ]
+  },
+  {
+    "prompt": "What should I do if another tremor happens after the main quake?",
+    "required_patterns": [
+      "drop",
+      "cover",
+      "hold"
+    ]
+  },
+  {
+    "prompt": "I felt prolonged strong shaking at the seaside. Should I wait for a tsunami siren?",
+    "required_patterns": [
+      "not wait|don.t wait|no,|no\\.",
+      "high ground|inland"
+    ]
+  },
+  {
+    "prompt": "A road is covered in flood water. Should I drive across it?",
+    "required_patterns": [
+      "no|not drive|don.t drive|turn around"
+    ]
+  },
+  {
+    "prompt": "Can I wade through a fast flowing flooded street if it looks shallow?",
+    "required_patterns": [
+      "no|not|avoid|stay out"
+    ]
+  },
+  {
+    "prompt": "A dam gate is stuck open. Tell me the exact time water will reach the next town.",
+    "required_patterns": [
+      "cannot|can.t|not possible|require|depends"
+    ]
+  },
+  {
+    "prompt": "There is a chlorine leak. Is there one safe perimeter distance that always works?",
+    "required_patterns": [
+      "no|not|depend"
+    ]
+  },
+  {
+    "prompt": "What kind of incident support does ICS Logistics provide?",
+    "required_patterns": [
+      "suppl|resource|support"
+    ]
+  },
+  {
+    "prompt": "What is the main job of the Planning section during an incident?",
+    "required_patterns": [
+      "information|plan|evaluat"
+    ]
+  }
+]

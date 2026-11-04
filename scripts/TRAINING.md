@@ -1,91 +1,59 @@
-# Real Qwen LoRA training
+# Actual disaster-model training and deployment
 
-`train_qwen.py` trains on the selected host's CUDA device, or CPU when CUDA is
-unavailable. A llama.cpp inference/RPC server does not perform backpropagation.
-The old `best_disaster_adapter.json` contains simulated metadata, not weights;
-it is preserved and never accepted as a resumable checkpoint.
+The active model is **Qwen/Qwen2.5-1.5B-Instruct** with a real PEFT LoRA adapter.
+The failed 0.5B coding model is retired from the app's model list. The reference
+answer bypass has been removed: all chat responses come from llama-server model
+inference. The chat template supplies only general role instructions, never
+question matches, reference passages, or predefined answers.
 
-Create `.venv-training` with Python 3.11 or newer and install
-`scripts/requirements-training.txt`. Install the appropriate PyTorch CPU/CUDA
-wheel for the host first. Put the llama.cpp conversion sources matching the
-bundled runtime (b12020) in `tools/llama.cpp`, or set `RGPU_LLAMA_CPP_DIR` for the
-app. The converter needs `convert_lora_to_gguf.py`, `conversion/`, and `gguf-py/`.
-The virtual environment and conversion checkout are ignored by Git.
+Training runs on the selected host's CUDA device, or CPU when unavailable.
+Install `scripts/requirements-training.txt` in `.venv-training`. The converter
+source matching the bundled llama.cpp runtime lives at `tools/llama.cpp`.
 
-The trainer uses the original Hugging Face float weights for
-`Qwen/Qwen2.5-Coder-0.5B-Instruct`. GGUF is used for inference only. To work
-offline, cache that model's config, tokenizer and `model.safetensors` in:
+Offline original HF float weights/config/tokenizer:
 
-- Linux: `~/.cache/gpu-mesh/training-base/Qwen2.5-Coder-0.5B-Instruct/`
-- Windows: `C:/rgpu/training-base/Qwen2.5-Coder-0.5B-Instruct/`
+- Rover/Rahul: `~/.cache/gpu-mesh/training-base/Qwen2.5-1.5B-Instruct/`
+- Windows: `C:/rgpu/training-base/Qwen2.5-1.5B-Instruct/`
 
-Run from the checkout on Linux:
+Inference base: `qwen2.5-1.5b-instruct-q4_k_m.gguf` from the official Qwen GGUF repo.
+Its SHA256 is `6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e`.
+It must be paired with the 1.5B adapter, never the old 0.5B adapter.
+
+Training uses `data/disaster_management_verified.jsonl`: 120 concise sourced
+question/answer variants. Source metadata is for corpus provenance; it is not
+retrieved at inference time. `data/disaster_generation_eval.json` contains
+separate prompt phrasings for actual generated-answer checks. These small probes
+are a regression check, not a comprehensive disaster-response certification.
+
+Continue the deployed best checkpoint on Linux:
 
 ```sh
 .venv-training/bin/python scripts/train_qwen.py --resume --epochs 2 --export-gguf
 ```
 
-On Windows:
+On Windows, use `.venv-training\Scripts\python.exe` with the same arguments.
+Defaults select the verified corpus, 384-token training length and family-specific
+output directory. Peer training uses `training-peer.json` with `ssh_target`,
+`root`, `platform` and optional `python`; SSH authentication must already work.
 
-```bat
-.venv-training\Scripts\python.exe scripts\train_qwen.py --resume --epochs 2 --export-gguf
-```
+Checkpoint locations:
 
-`--epochs` specifies additional epochs; `--max-steps 1` limits a smoke test.
-`--checkpoint <checkpoint-directory>` resumes a specific real checkpoint,
-including optimizer and RNG state. Resumed runs default to a lower learning
-rate. Model/dataset/split mismatches or corrupt checkpoints fail explicitly.
+- Linux: `~/.cache/gpu-mesh/models/checkpoints-disaster-1.5b/`
+- Windows: `C:/rgpu/models/checkpoints-disaster-1.5b/`
 
-Checkpoints live in `~/.cache/gpu-mesh/models/checkpoints` on Linux and
-`C:/rgpu/models/checkpoints` on Windows. Each checkpoint directory is immutable.
-`best.json` advances only when measured heldout loss strictly improves on the
-previous best and the initial evaluation. `active_adapter.json` references a
-hashed GGUF export; both local inference and remote workers load it with
-`--lora` only for the matching Qwen 0.5B base. Restart the inference session
-after training. Old model weights and checkpoints remain intact.
+Deploy the immutable epoch directory plus `best.json` and `active_adapter.json`.
+The manifest records the matching base identity and exported adapter hash. The
+app verifies both before using `--lora`. Copy full optimizer/tokenizer files when
+further local training is required. Preserve checkpoints; `best.json` advances
+only for strictly improved measured validation loss. `--checkpoint` resumes
+weights, optimizer and RNG. `--fine-tune-data --checkpoint <path>` explicitly
+continues learned weights on a changed corpus and starts a new epoch cursor;
+use a separate output directory because old/new validation losses differ.
 
-For **Peer**, configure `training-peer.json` in the requesting checkout:
+Both local and peer chat use port 8080 with transparent byte forwarding. Local
+llama-server uses 18081, peer worker uses 18080. There is no answer interception.
+Rebuild/restart the app on all devices after changing model selection or adapter
+integration; restart inference after changing the deployed adapter.
 
-```json
-{
-  "ssh_target": "user@peer-address",
-  "root": "/home/user/Projects/rgpu",
-  "platform": "linux"
-}
-```
-
-The remote host needs its own environment, model cache, converter and SSH key
-access. Windows peers use `"platform": "windows"` and a root such as `C:/rgpu`.
-Optional `python` overrides the remote interpreter. Environment alternatives
-are `RGPU_TRAIN_PEER`, `RGPU_TRAIN_PEER_ROOT`, `RGPU_TRAIN_PEER_OS` and
-`RGPU_TRAIN_PEER_PYTHON`. Missing configuration reports an error; Peer never
-silently trains locally. Training artifacts stay on the training host; copy
-the referenced immutable directory and activation manifest together when
-deploying to another inference host.
-
-Verification results are in `artifacts/training-validation/`. The current
-20-example corpus and 0.5B model still fail answer-quality checks despite
-improved heldout loss. Successful training/export is not evidence of accurate
-emergency advice. The Windows report records actual base/adapter answers.
-
-### Offline disaster reference answers
-
-The small Qwen 0.5B model did not reliably answer even its training questions.
-For that model, the app's chat endpoint now routes matching disaster questions to
-bundled source summaries in `data/disaster_references.json`. These answers start
-with **Offline reference summary**, include official source links, and carry
-`rgpu_response_mode: offline_reference` in the API response. No network lookup is
-made at runtime. This is reference retrieval, not evidence of learned model quality.
-
-The initial catalog covers incident command, evacuation drills, earthquakes,
-tsunamis, flood precautions, and chemical-emergency basics. Unsupported disaster
-questions receive an explicit insufficient-reference answer. It does not supply
-site-specific response plans, spill distances, evacuation routes, or medical
-triage protocols. General chat, tool calls, other models and raw `/completion`
-requests continue to use the model. Streaming chat responses remain OpenAI SSE.
-
-Both local and peer chat use port 8080. Local llama-server now listens behind
-the app on port 18081; peer worker llama-server continues to use 18080. Restart
-inference after rebuilding to apply the new routing. Existing weights and best
-checkpoint selection are preserved. Lower validation loss alone still does not
-establish that a trained model produces reliable disaster-response answers.
+Actual GPU training and raw llama-server generation reports are saved under
+`artifacts/training-validation/`. No Git push is performed for this change.

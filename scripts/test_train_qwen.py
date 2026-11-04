@@ -114,6 +114,8 @@ class TrainerTests(unittest.TestCase):
             manifest = json.loads((Path(directory) / "active_adapter.json").read_text())
             self.assertEqual(adapter.stat().st_mtime_ns, before)
             self.assertEqual(manifest["adapter_sha256"], trainer.file_sha256(adapter))
+            self.assertEqual(manifest["base_model"], metadata["base_model"])
+            self.assertEqual(manifest["base_gguf_filename"], trainer.SUPPORTED_MODELS[metadata["base_model"]])
             self.assertEqual(manifest["adapter_file"], path.name + "/adapter.gguf")
 
     def test_gguf_mapping_is_explicit_and_limited(self):

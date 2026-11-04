@@ -1,5 +1,5 @@
 mod cluster_engine;
-mod disaster_grounding;
+mod web_proxy;
 mod mesh;
 mod net_setup;
 mod network;
@@ -188,9 +188,9 @@ impl AppState {
             train_running: false,
             train_telemetry: None,
             train_logs: vec![
-                "[TRAINER] Engine ready for Qwen 2.5 Disaster Management training.".to_string(),
+                "[TRAINER] Engine ready for Qwen 2.5 1.5B Disaster Management training.".to_string(),
                 "[TRAINER] Target selection active: Local Node & Remote Peer mesh offloading.".to_string(),
-                "[DATASET] Loaded disaster_management_train.jsonl (20 critical triage scenarios).".to_string(),
+                "[DATASET] Loaded disaster_management_verified.jsonl (120 concise disaster Q&A).".to_string(),
             ],
             train_target: TrainingTarget::Local,
             train_epochs: 2,
@@ -203,7 +203,7 @@ impl AppState {
             remote_session: None,
             web_proxy_stop_tx: None,
             available_models: vec![
-                ModelManifest::default_qwen_draft_0_5b(),
+                ModelManifest::disaster_qwen_1_5b(),
                 ModelManifest::default_qwen_7b(),
                 ModelManifest::qwen_14b_coder(),
             ],
@@ -478,20 +478,20 @@ fn render_training_metrics(train_running: bool, train_telemetry: Option<&TrainTe
                                 .justify_between()
                                 .items_center()
                                 .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(rgb(0xa1a1aa)).child("BASE MODEL"))
-                                .child(div().px_2().py_0p5().rounded_sm().bg(rgb(0x3b1d54)).text_xs().text_color(rgb(0xd8b4fe)).child("QWEN 0.5B"))
+                                .child(div().px_2().py_0p5().rounded_sm().bg(rgb(0x3b1d54)).text_xs().text_color(rgb(0xd8b4fe)).child("QWEN 1.5B"))
                         )
                         .child(
                             div()
                                 .text_2xl()
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(rgb(0xd8b4fe))
-                                .child("Qwen 2.5 Coder 0.5B")
+                                .child("Qwen 2.5 1.5B")
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(rgb(0x71717a))
-                                .child(r"491.4 MB GGUF • Disaster LoRA")
+                                .child(r"1.12 GB GGUF • Disaster LoRA")
                         )
                 )
                 // Metric 2: Live Loss & Best
@@ -888,7 +888,7 @@ fn render_training_controller(
                         .border_color(rgb(0x27272a))
                         .text_xs()
                         .text_color(rgb(0xa1a1aa))
-                        .child("Corpus: 20 Scenarios (FEMA / NDMA)")
+                        .child("Corpus: 120 verified Q&A")
                 )
                 .child(
                     div()
@@ -1060,7 +1060,7 @@ fn render_training_data_inspector(train_telemetry: Option<&TrainTelemetry>) -> D
         } else {
             "1. Tsunami Warning & Coastal Evacuation: Activate coastal sirens, EAS broadcast, command immediate vertical evacuation...\n2. Incident Command System: Establish EOC outside structural collapse radius...\n3. Critical Lifeline Isolation: SCADA shutdown of gas mains...".to_string()
         };
-        let s = format!("Sample {}/{} (Ep {})", ((t.step.saturating_sub(1)) % 20) + 1, 20, t.epoch);
+        let s = format!("Sample {}/{} (Ep {})", ((t.step.saturating_sub(1)) % 120) + 1, 120, t.epoch);
         (cat, tit, p, r, s)
     } else {
         (
@@ -1068,7 +1068,7 @@ fn render_training_data_inspector(train_telemetry: Option<&TrainTelemetry>) -> D
             "M7.2 Coastal Seismic Golden Hour Protocol".to_string(),
             "A magnitude 7.2 earthquake has occurred 15 km offshore from a coastal metropolitan area with high building density. What are the immediate triage and incident command protocols for the first 60 minutes?".to_string(),
             "1. Tsunami Warning & Coastal Evacuation (Minutes 0-10): Subduction earthquake >M7.0 within 50km offshore triggers immediate tsunami risk. Command immediate vertical evacuation (minimum 4th floor or 15m elevation)...\n2. Incident Command System (ICS) Mobilization (Minutes 5-15): Establish EOC...".to_string(),
-            "Sample 1/20 (Ready)".to_string(),
+            "120 verified Q&A (Ready)".to_string(),
         )
     };
 
@@ -2115,6 +2115,7 @@ impl Render for GpuMeshApp {
                                                                 
                                                                 let rpc_target = rpc_endpoints.join(",");
                                                                 
+                                                                if s.selected_model_idx == 0 { s.available_models[0] = ModelManifest::disaster_qwen_1_5b(); }
                                                                 let manifest = s.available_models[s.selected_model_idx].clone();
                                                                 let model = ClusterEngineManager::get_model_path_for_manifest(&manifest);
                                                                 let model_size_mb = manifest.size / (1024 * 1024);
@@ -2148,7 +2149,7 @@ impl Render for GpuMeshApp {
                                                                             Ok(session) => {
                                                                                 let host = endpoint.split(':').next().unwrap_or("127.0.0.1").to_string();
                                                                                 let target_addr = format!("{}:18080", host);
-                                                                                let proxy_tx = match disaster_grounding::start_proxy(target_addr, disaster_grounding::applies_to(&model)) {
+                                                                                let proxy_tx = match web_proxy::start(target_addr) {
                                                                                     Ok(tx) => tx,
                                                                                     Err(error) => {
                                                                                         let mut s = state_bg.lock();
@@ -2179,7 +2180,7 @@ impl Render for GpuMeshApp {
                                                                     let res = ClusterEngineManager::spawn_server(&rpc_target, &model, local_vram, &remote_vram_list);
                                                                     match res {
                                                                         Ok(pid) => {
-                                                                            let proxy_tx = match disaster_grounding::start_proxy("127.0.0.1:18081".to_string(), disaster_grounding::applies_to(&model)) {
+                                                                            let proxy_tx = match web_proxy::start("127.0.0.1:18081".to_string()) {
                                                                                 Ok(tx) => tx,
                                                                                 Err(error) => {
                                                                                     ClusterEngineManager::stop_server(pid);

@@ -459,6 +459,7 @@ impl ClusterEngineManager {
             .open(&log_path)
             .map_err(|e| format!("Failed to create log file {}: {}", log_path.display(), e))?;
 
+        crate::remote_llm::configure_disaster_chat(&mut cmd, std::path::Path::new(model_path));
         cmd.args(&args)
             .stdout(Stdio::from(log_file.try_clone().map_err(|e| {
                 format!("Failed to clone log file handle: {}", e)
